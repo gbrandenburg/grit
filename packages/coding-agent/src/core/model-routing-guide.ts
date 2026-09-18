@@ -1,8 +1,9 @@
 import { readFileSync, statSync } from "node:fs";
+import { CONFIG_DIR_NAME } from "../config.js";
 import { parseFrontmatter } from "../utils/frontmatter.js";
 import { resolveToCwd } from "./tools/path-utils.js";
 
-export const DEFAULT_MODEL_ROUTING_GUIDE_PATH = "~/.dreb/agent/model-routing-guide.md";
+export const DEFAULT_MODEL_ROUTING_GUIDE_PATH = `~/${CONFIG_DIR_NAME}/agent/model-routing-guide.md`;
 export const MAX_MODEL_ROUTING_GUIDE_BYTES = 128 * 1024;
 
 const REQUIRED_MODEL_SUBSECTIONS = [

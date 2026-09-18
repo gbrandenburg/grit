@@ -3784,7 +3784,7 @@ describe("screen smoke tests", () => {
 		const el = mount(() => <MemoriesScreen store={store} />);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 
-		expect(el.textContent).toContain("Edit dreb memory only");
+		expect(el.textContent).toContain("Edit Grit memory only");
 		expect(el.textContent).toContain("Complete index warning");
 		const textarea = el.querySelector("textarea") as HTMLTextAreaElement;
 		textarea.value = `${textarea.value}\nextra`;

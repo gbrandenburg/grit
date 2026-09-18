@@ -1,5 +1,5 @@
 /**
- * Dashboard memory API — dreb-only global/project memory editor.
+ * Dashboard memory API — Grit-only global/project memory editor.
  *
  * Scope ids are derived from the server's current cwd inventory. Clients can
  * select only those ids; absolute target paths never cross the wire as
@@ -9,10 +9,11 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import type { Stats } from "node:fs";
+import { existsSync } from "node:fs";
 import { open, readdir, readFile, realpath, rename, stat, unlink } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { findGitRoot, parseFrontmatter } from "@dreb/coding-agent";
+import { CONFIG_DIR_NAME, findGitRoot, parseFrontmatter } from "@dreb/coding-agent";
 import type {
 	MemoryDocumentDto,
 	MemoryEntryMetadataDto,
@@ -40,6 +41,11 @@ function sha256Hex(content: string): string {
 
 function projectScopeId(canonicalRoot: string): string {
 	return `project-${sha256Hex(canonicalRoot).slice(0, 24)}`;
+}
+
+function memoryConfigDir(root: string): string {
+	const gritDir = join(root, CONFIG_DIR_NAME);
+	return existsSync(gritDir) ? gritDir : join(root, ".dreb");
 }
 
 function isWithinCanonicalRoot(target: string, root: string): boolean {
@@ -231,7 +237,7 @@ export class MemoryApi {
 	async scopes(cwdInventory: string[]): Promise<MemoryScopeDto[]> {
 		const scopes: MemoryScopeDto[] = [];
 		const canonicalHome = (await canonicalExistingDirectory(this.homeDir)) ?? resolve(this.homeDir);
-		const globalMemoryDir = resolve(canonicalHome, ".dreb", "memory");
+		const globalMemoryDir = resolve(memoryConfigDir(canonicalHome), "memory");
 		scopes.push({
 			id: "global",
 			kind: "global",
@@ -251,7 +257,7 @@ export class MemoryApi {
 			roots.set(canonicalRoot, canonicalRoot);
 		}
 		for (const root of [...roots.keys()].sort((a, b) => a.localeCompare(b))) {
-			const memoryDir = join(root, ".dreb", "memory");
+			const memoryDir = join(memoryConfigDir(root), "memory");
 			const canonicalMemoryDir = await canonicalExistingDirectory(memoryDir);
 			if (!canonicalMemoryDir) continue;
 			const dirents = await readdir(canonicalMemoryDir, { withFileTypes: true });

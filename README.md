@@ -1,4 +1,6 @@
-# dreb
+# Grit
+
+Grit is Gerit's personal downstream build of [dreb](https://github.com/aebrer/dreb), rebranded for a broader personal productivity workflow while retaining dreb's hackable agent runtime and upstream compatibility.
 
 dreb is a hackable, open-source terminal coding agent and agent runtime for people who want to own their AI development workflow. It gives you a practical coding assistant today — tools, sessions, memory, model switching, subagents, and a polished TUI — while keeping the core flexible enough to reshape with skills, extensions, packages, custom providers, and alternate frontends. Its web dashboard puts every agent session in the browser: start work at your desk, steer it from your phone.
 

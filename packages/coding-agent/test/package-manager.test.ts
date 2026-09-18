@@ -1302,7 +1302,7 @@ export default function(api) { api.registerTool({ name: "test", description: "te
 
 			expect(runCommandSpy).toHaveBeenCalledWith(
 				"npm",
-				["install", "example@latest", "--prefix", join(tempDir, ".dreb", "npm")],
+				["install", "example@latest", "--prefix", join(tempDir, ".grit", "npm")],
 				undefined,
 			);
 		});

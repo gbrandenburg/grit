@@ -251,28 +251,28 @@ describe("SettingsManager", () => {
 			expect(manager.getTheme()).toBe("dark");
 		});
 
-		it("should create .dreb folder when writing project settings", async () => {
-			// Create agent dir with global settings, but NO .dreb folder in project
+		it("should create .grit folder when writing project settings", async () => {
+			// Create agent dir with global settings, but NO .grit folder in project
 			const settingsPath = join(agentDir, "settings.json");
 			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }));
 
-			// Delete the .dreb folder that beforeEach created
+			// Delete the legacy .dreb folder that beforeEach created
 			rmSync(join(projectDir, ".dreb"), { recursive: true });
 
 			const manager = SettingsManager.create(projectDir, agentDir);
 
-			// .dreb folder should NOT exist yet
-			expect(existsSync(join(projectDir, ".dreb"))).toBe(false);
+			// .grit folder should NOT exist yet
+			expect(existsSync(join(projectDir, ".grit"))).toBe(false);
 
 			// Write a project-specific setting
 			manager.setProjectPackages([{ source: "npm:test-pkg" }]);
 			await manager.flush();
 
-			// Now .dreb folder should exist
-			expect(existsSync(join(projectDir, ".dreb"))).toBe(true);
+			// Now .grit folder should exist
+			expect(existsSync(join(projectDir, ".grit"))).toBe(true);
 
 			// And settings file should be created
-			expect(existsSync(join(projectDir, ".dreb", "settings.json"))).toBe(true);
+			expect(existsSync(join(projectDir, ".grit", "settings.json"))).toBe(true);
 		});
 	});
 

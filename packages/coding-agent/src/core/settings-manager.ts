@@ -3,7 +3,7 @@ import type { Transport } from "@dreb/ai";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join, resolve } from "path";
 import lockfile from "proper-lockfile";
-import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import { getAgentDir, getProjectConfigDir } from "../config.js";
 import type { ContextTrustPolicy } from "./context-trust.js";
 import { log } from "./logger.js";
 import { expandPath } from "./tools/path-utils.js";
@@ -230,7 +230,7 @@ export class FileSettingsStorage implements SettingsStorage {
 
 	constructor(cwd: string = process.cwd(), agentDir: string = getAgentDir()) {
 		this.globalSettingsPath = join(agentDir, "settings.json");
-		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+		this.projectSettingsPath = join(getProjectConfigDir(cwd), "settings.json");
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {

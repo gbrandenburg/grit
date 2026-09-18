@@ -273,20 +273,22 @@ describe("sw activate handler", () => {
 		return waitPromise;
 	}
 
-	it("D1: deletes old dreb-dashboard-* caches but preserves the current one", async () => {
+	it("D1: deletes old dashboard caches but preserves the current one", async () => {
 		const env = loadSW();
-		// SHELL_CACHE in tests is `dreb-dashboard-shell-v__SW_VERSION__` (the
+		// SHELL_CACHE in tests is `grit-dashboard-shell-v__SW_VERSION__` (the
 		// placeholder — sw.js is loaded as source, not the build-substituted copy).
-		const currentShell = "dreb-dashboard-shell-v__SW_VERSION__";
+		const currentShell = "grit-dashboard-shell-v__SW_VERSION__";
 		env.caches.keys.mockResolvedValue([
 			currentShell, // current — must NOT be deleted
-			"dreb-dashboard-shell-vold", // prior version — must be deleted
+			"grit-dashboard-shell-vold", // prior Grit version — must be deleted
+			"dreb-dashboard-shell-vold", // legacy version — must be deleted
 			"unrelated-cache", // foreign — must NOT be deleted
 		]);
 
 		await fireActivate(env);
 
-		expect(env.caches.delete).toHaveBeenCalledTimes(1);
+		expect(env.caches.delete).toHaveBeenCalledTimes(2);
+		expect(env.caches.delete).toHaveBeenCalledWith("grit-dashboard-shell-vold");
 		expect(env.caches.delete).toHaveBeenCalledWith("dreb-dashboard-shell-vold");
 		expect(env.caches.delete).not.toHaveBeenCalledWith(currentShell);
 		expect(env.caches.delete).not.toHaveBeenCalledWith("unrelated-cache");

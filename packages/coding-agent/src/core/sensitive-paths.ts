@@ -11,6 +11,8 @@ export const DEFAULT_SENSITIVE_PATTERNS: string[] = [
 	"~/.gnupg/private-keys-v1.d/*",
 	"~/.dreb/secrets/*",
 	"~/.dreb/agent/auth.json",
+	"~/.grit/secrets/*",
+	"~/.grit/agent/auth.json",
 	"~/.aws/credentials",
 	"~/.config/gcloud/credentials.db",
 ];

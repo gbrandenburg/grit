@@ -36,8 +36,10 @@ const DEFAULT_FORBIDDEN_PATTERNS: string[] = [
 	// Sensitive file access — block reading credential files via bash
 	// Matches bare commands AND absolute-path invocations (/bin/cat, /usr/bin/cat, etc.)
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*(?:~|\\.ssh)/id_(?!.*\\.pub\\b)", // SSH private keys (not .pub)
-	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.dreb/secrets/", // dreb credential store
-	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.dreb/agent/auth\\.json", // dreb auth storage
+	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.dreb/secrets/", // legacy dreb credential store
+	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.dreb/agent/auth\\.json", // legacy dreb auth storage
+	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.grit/secrets/", // Grit credential store
+	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.grit/agent/auth\\.json", // Grit auth storage
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.aws/credentials", // AWS credentials
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.gnupg/private-keys", // GPG private keys
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.config/gcloud/credentials\\.db", // GCloud credentials
@@ -85,6 +87,8 @@ const QUOTED_CONTENT_PATTERNS: string[] = [
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*(?:~|\\.ssh)/id_(?!.*\\.pub\\b)",
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.dreb/secrets/",
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.dreb/agent/auth\\.json",
+	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.grit/secrets/",
+	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.grit/agent/auth\\.json",
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.aws/credentials",
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.gnupg/private-keys",
 	"^(?:/\\S+/)?(?:cat|head|tail|less|more|strings|grep|sed|awk|base64|xxd)\\s+.*\\.config/gcloud/credentials\\.db",

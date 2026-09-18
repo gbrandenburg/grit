@@ -219,7 +219,7 @@ export function MemoriesScreen(props: { store: AppStore }): JSX.Element {
 					<div>
 						<h1>Memories</h1>
 						<p class="scope-note">
-							Edit dreb memory only: global ~/.dreb/memory plus known project .dreb/memory scopes. Claude memory
+							Edit Grit memory only: global ~/.grit/memory plus known project .grit/memory scopes. Claude memory
 							paths are never included.
 						</p>
 					</div>

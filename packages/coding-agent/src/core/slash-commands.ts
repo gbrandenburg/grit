@@ -40,7 +40,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		description: "Hatch or manage your terminal companion (pet, reroll, off)",
 		dashboard: false,
 	},
-	{ name: "quit", description: "Quit dreb" },
+	{ name: "quit", description: "Quit Grit" },
 ];
 
 const BUILTIN_BY_NAME = new Map(BUILTIN_SLASH_COMMANDS.map((command) => [command.name, command]));

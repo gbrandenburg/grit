@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dreb-dashboard — launch the dreb web dashboard server.
+ * grit-dashboard — launch the Grit web dashboard server.
  *
  * Modes (exactly two, no LAN mode):
  *   default        loopback bind (127.0.0.1), no auth, no Tailscale needed
@@ -8,15 +8,15 @@
  *                  passes identity allowlist + pairing code + device cookies
  *
  * Usage:
- *   dreb-dashboard [--port 5343] [--remote --allow me@example.com [--allow ...]]
+ *   grit-dashboard [--port 5343] [--remote --allow me@example.com [--allow ...]]
  */
 
-import { existsSync, readFileSync, watch } from "node:fs";
+import { existsSync, readFileSync, realpathSync, watch } from "node:fs";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
-import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { APP_NAME, getAgentDir } from "@dreb/coding-agent";
 import { DashboardAuth } from "./server/auth.js";
 import { DashboardImageService } from "./server/dashboard-images.js";
 import { ImagePreviewWorker } from "./server/image-preview.js";
@@ -228,9 +228,10 @@ export function createTlsWatchers(deps: TlsWatchDeps): TlsWatchController {
 	return { watchers, clearReloadTimer };
 }
 
-const HELP = `dreb-dashboard — dreb web dashboard server
+const DASHBOARD_NAME = `${APP_NAME}-dashboard`;
+const HELP = `${DASHBOARD_NAME} — ${APP_NAME} web dashboard server
 
-Usage: dreb-dashboard [options]
+Usage: ${DASHBOARD_NAME} [options]
 
 Options:
   --port <n>          Port to listen on (default ${DEFAULT_PORT})
@@ -268,7 +269,7 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	const agentDir = join(homedir(), ".dreb", "agent");
+	const agentDir = getAgentDir();
 	const auth = new DashboardAuth({
 		remoteEnabled: args.remote,
 		allowedIdentities: args.allow,
@@ -409,7 +410,15 @@ async function main(): Promise<void> {
 
 // Only run when executed directly (not when imported for the library exports).
 const entryPath = process.argv[1];
-if (entryPath && import.meta.url === new URL(`file://${entryPath}`).href) {
+let isMainModule = false;
+if (entryPath) {
+	try {
+		isMainModule = realpathSync(entryPath) === fileURLToPath(import.meta.url);
+	} catch {
+		isMainModule = false;
+	}
+}
+if (isMainModule) {
 	main().catch((err) => {
 		console.error(`fatal: ${err instanceof Error ? err.message : String(err)}`);
 		process.exit(1);

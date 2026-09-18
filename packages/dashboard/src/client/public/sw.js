@@ -15,7 +15,7 @@
 
 // Replaced at build time; see vite.config.ts generateBundle hook.
 const SW_CACHE_VERSION = "__SW_VERSION__";
-const SHELL_CACHE = `dreb-dashboard-shell-v${SW_CACHE_VERSION}`;
+const SHELL_CACHE = `grit-dashboard-shell-v${SW_CACHE_VERSION}`;
 
 // Shell assets (HTML, JS, CSS) get a network-first strategy. The dashboard
 // has no value when disconnected from its host; we never serve stale content
@@ -67,7 +67,7 @@ self.addEventListener("activate", (event) => {
 				.then((keys) =>
 					Promise.all(
 						keys
-							.filter((key) => key.startsWith("dreb-dashboard-") && key !== SHELL_CACHE)
+							.filter((key) => (key.startsWith("grit-dashboard-") || key.startsWith("dreb-dashboard-")) && key !== SHELL_CACHE)
 							.map((key) => caches.delete(key)),
 					),
 				)

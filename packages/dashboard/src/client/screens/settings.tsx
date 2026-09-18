@@ -539,7 +539,7 @@ export function SettingsScreen(props: {
 		if (!arbiter.guidePath?.trim()) {
 			return {
 				ready: true,
-				message: "enabled — using ~/.dreb/agent/model-routing-guide.md; live scope/guide checked at dispatch",
+				message: "enabled — using ~/.grit/agent/model-routing-guide.md; live scope/guide checked at dispatch",
 			};
 		}
 		return { ready: true, message: "enabled — live scope and guide are validated before every child spawn" };
@@ -772,7 +772,7 @@ export function SettingsScreen(props: {
 								<div class="setting-row">
 									<label class="setting-label" for="dispatch-arbiter-guide-path">
 										<span class="name">routing guide path</span>
-										<span class="hint">blank uses ~/.dreb/agent/model-routing-guide.md</span>
+										<span class="hint">blank uses ~/.grit/agent/model-routing-guide.md</span>
 									</label>
 									<span class="setting-control">
 										<input
@@ -783,7 +783,7 @@ export function SettingsScreen(props: {
 													? current().subagentArbiter?.guidePath
 													: ""
 											}
-											placeholder="~/.dreb/agent/model-routing-guide.md"
+											placeholder="~/.grit/agent/model-routing-guide.md"
 											onChange={(event) => {
 												const guidePath = event.currentTarget.value.trim();
 												saveArbiterPolicy({ guidePath: guidePath || undefined });

@@ -14,7 +14,7 @@ import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
 import { selectSession } from "./cli/session-picker.js";
-import { APP_NAME, getAgentDir, getModelsPath, loadProvidersEnv, VERSION } from "./config.js";
+import { APP_NAME, CONFIG_DIR_NAME, getAgentDir, getModelsPath, loadProvidersEnv, VERSION } from "./config.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { LoadExtensionsResult } from "./core/extensions/index.js";
@@ -104,7 +104,7 @@ function printPackageCommandHelp(command: PackageCommand): void {
 Install a package and add it to settings.
 
 Options:
-  -l, --local    Install project-locally (.dreb/settings.json)
+  -l, --local    Install project-locally (${CONFIG_DIR_NAME}/settings.json)
 
 Examples:
   ${APP_NAME} install npm:@foo/bar
@@ -124,7 +124,7 @@ Remove a package and its source from settings.
 Alias: ${APP_NAME} uninstall <source> [-l]
 
 Options:
-  -l, --local    Remove from project settings (.dreb/settings.json)
+  -l, --local    Remove from project settings (${CONFIG_DIR_NAME}/settings.json)
 
 Examples:
   ${APP_NAME} remove npm:@foo/bar
@@ -608,7 +608,7 @@ export function buildSessionOptions(
 }
 
 /**
- * Handle `dreb dashboard [...args]` — delegate to the @dreb/dashboard package.
+ * Handle the dashboard subcommand — delegate to the @dreb/dashboard package.
  *
  * The dashboard is a separate workspace package; coding-agent must not depend
  * on it (the dashboard depends on coding-agent — a hard dependency here would
@@ -627,7 +627,7 @@ async function handleDashboardCommand(args: string[]): Promise<boolean> {
 			"The dashboard package is not installed.\n\n" +
 				"Install it with:\n" +
 				"  npm install -g @dreb/dashboard\n\n" +
-				"Then run `dreb dashboard` again, or run `dreb-dashboard` directly.",
+				`Then run \`${APP_NAME} dashboard\` again, or run \`${APP_NAME}-dashboard\` directly.`,
 		);
 		process.exit(1);
 	}

@@ -1,7 +1,7 @@
 /**
- * RPC runtime pool — one `dreb --mode rpc` child process per live session.
+ * RPC runtime pool — one `grit --mode rpc` child process per live session.
  *
- * dreb's RPC mode is strictly one-session-per-process (switch_session repoints
+ * Grit's RPC mode is strictly one-session-per-process (switch_session repoints
  * the same process; it never multiplexes), so the pool spawns N children keyed
  * by an opaque runtime key. The telegram bridge is the in-repo precedent.
  */
@@ -23,7 +23,7 @@ import {
 	type SubagentArbitrationDto,
 } from "../shared/protocol.js";
 
-/** Resolve the absolute path to the dreb CLI (RpcClient defaults to a cwd-relative path). */
+/** Resolve the absolute path to the Grit CLI (RpcClient defaults to a cwd-relative path). */
 export function resolveDrebCliPath(): string {
 	const resolved = import.meta.resolve("@dreb/coding-agent");
 	return join(dirname(fileURLToPath(resolved)), "cli.js");

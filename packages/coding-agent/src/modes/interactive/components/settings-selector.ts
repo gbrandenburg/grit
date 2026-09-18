@@ -696,12 +696,12 @@ export class SettingsSelectorComponent extends Container {
 			{
 				id: "dispatch-arbiter-guide",
 				label: "Dispatch Arbiter guide",
-				description: "Routing-guide path; blank uses ~/.dreb/agent/model-routing-guide.md",
+				description: "Routing-guide path; blank uses ~/.grit/agent/model-routing-guide.md",
 				currentValue: arbiterSettings.guidePath ?? "default",
 				submenu: (currentValue, done) =>
 					new TextInputSubmenu(
 						"Dispatch Arbiter Guide Path",
-						"Enter a path, or leave blank for ~/.dreb/agent/model-routing-guide.md",
+						"Enter a path, or leave blank for ~/.grit/agent/model-routing-guide.md",
 						currentValue === "default" ? "" : currentValue,
 						async (value) => {
 							const guidePath = value.trim();

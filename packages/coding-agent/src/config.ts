@@ -175,13 +175,26 @@ export const VERSION: string = pkg.version;
 // e.g., DREB_CODING_AGENT_DIR
 export const ENV_AGENT_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR`;
 
+/**
+ * Resolve the project configuration directory while retaining compatibility
+ * with existing dreb projects. A real .grit directory always wins; an
+ * existing .dreb directory is used until that project is migrated.
+ */
+export function getProjectConfigDir(cwd: string = process.cwd()): string {
+	const gritDir = join(cwd, CONFIG_DIR_NAME);
+	if (existsSync(gritDir)) return gritDir;
+	const legacyDir = join(cwd, ".dreb");
+	if (existsSync(legacyDir)) return legacyDir;
+	return gritDir;
+}
+
 // =============================================================================
-// User Config Paths (~/.dreb/agent/*)
+// User Config Paths (~/.grit/agent/*)
 // =============================================================================
 
-/** Get the agent config directory (e.g., ~/.dreb/agent/) */
+/** Get the agent config directory (e.g., ~/.grit/agent/) */
 export function getAgentDir(): string {
-	const envDir = process.env[ENV_AGENT_DIR];
+	const envDir = process.env[ENV_AGENT_DIR] ?? process.env.DREB_CODING_AGENT_DIR;
 	if (envDir) {
 		// Expand tilde to home directory
 		if (envDir === "~") return homedir();
@@ -252,7 +265,7 @@ export function getSecretsDir(): string {
 }
 
 /**
- * Load providers.env from ~/.dreb/secrets/providers.env.
+ * Load providers.env from ~/.grit/secrets/providers.env.
  * Sets env vars for API keys and provider configuration.
  * Explicit env vars take priority (won't be overwritten).
  */

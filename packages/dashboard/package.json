@@ -13,6 +13,7 @@
 		}
 	},
 	"bin": {
+		"grit-dashboard": "./dist/index.js",
 		"dreb-dashboard": "./dist/index.js"
 	},
 	"publishConfig": {
