@@ -4,7 +4,7 @@ export {
 	BuddyController,
 	type BuddyControllerConfig,
 } from "./buddy-controller.js";
-export { BuddyManager, checkOllama, type OllamaStatus } from "./buddy-manager.js";
+export { BuddyManager, checkOllama, KERN_NAME, type OllamaStatus } from "./buddy-manager.js";
 export { createBuddyRng, createBuddySeed, fnv1a, mulberry32, rollFloat, rollInt, rollWeighted } from "./buddy-prng.js";
 export { applyEyes, getSpeciesFrames, rollEyes, rollHat, rollSpecies, rollStats } from "./buddy-species.js";
 export type { BuddyState, CompanionBones, SpeciesName, StatBlock, StoredCompanion } from "./buddy-types.js";

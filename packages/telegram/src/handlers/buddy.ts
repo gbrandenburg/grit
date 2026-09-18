@@ -16,6 +16,7 @@ import type { SendFn } from "./events.js";
 // ---------------------------------------------------------------------------
 
 export const SPECIES_EMOJI: Record<string, string> = {
+	Kern: "◈",
 	Duck: "🦆",
 	Goose: "🪿",
 	Blob: "🟢",

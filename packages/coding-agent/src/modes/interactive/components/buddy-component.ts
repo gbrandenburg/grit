@@ -21,7 +21,16 @@ const IDLE_INTERVAL_MS = 500;
 const SPEECH_BUBBLE_DURATION_MS = 10000;
 const PET_DURATION_MS = 2500;
 const HEART_CHARS = ["❤️", "💕", "💖", "💗", "✨"];
+const KERN_PET_CHARS = ["·", "•", "✦", "◇", "◆"];
+const KERN_NARROW_FRAMES = ["◇", "◆", "◈"];
 const NARROW_THRESHOLD = 100;
+const STAT_LABELS: Record<Stat, string> = {
+	[Stat.FOCUS]: "F",
+	[Stat.MOMENTUM]: "M",
+	[Stat.RESILIENCE]: "R",
+	[Stat.CLARITY]: "C",
+	[Stat.MISCHIEF]: "X",
+};
 const SPEECH_MAX_CONTENT_LINES = 3;
 const SIDE_PANEL_GAP = 2;
 
@@ -87,13 +96,14 @@ export class BuddyComponent implements Component {
 	/** Trigger pet animation */
 	pet(): void {
 		this.isPetting = true;
-		// Spawn hearts
+		// Spawn a restrained particle animation for Kern, hearts for legacy forms.
 		const spriteWidth = getSpeciesWidth(this.state.species);
+		const petChars = this.state.species === "Kern" ? KERN_PET_CHARS : HEART_CHARS;
 		for (let i = 0; i < 5; i++) {
 			this.hearts.push({
 				x: Math.floor(Math.random() * spriteWidth),
 				y: -1 - Math.floor(Math.random() * 3),
-				char: HEART_CHARS[Math.floor(Math.random() * HEART_CHARS.length)],
+				char: petChars[Math.floor(Math.random() * petChars.length)],
 				life: 5 + Math.floor(Math.random() * 5),
 			});
 		}
@@ -166,14 +176,14 @@ export class BuddyComponent implements Component {
 		const lines: string[] = [];
 		const frames = getSpeciesFrames(this.state.species);
 		const frame = frames[this.currentFrame % this.totalFrames];
-		const rendered = applyEyes(frame, this.state.eyeStyle);
+		const rendered = this.state.species === "Kern" ? frame : applyEyes(frame, this.state.eyeStyle);
 		const spriteWidth = getSpeciesWidth(this.state.species);
 
 		// Build LEFT block: hat + heart animation + sprite lines
 		const leftLines: string[] = [];
 
 		// Hat line
-		if (this.state.hat) {
+		if (this.state.hat && this.state.species !== "Kern") {
 			const hatPad = Math.max(0, Math.floor((spriteWidth - 1) / 2) - 1);
 			leftLines.push(" ".repeat(hatPad) + this.state.hat);
 		}
@@ -225,7 +235,7 @@ export class BuddyComponent implements Component {
 		const statParts = (Object.values(Stat) as Stat[]).map((s) => {
 			const val = this.state.stats[s];
 			const bar = this.statBar(val);
-			return `${theme.fg("muted", s[0])}:${bar}`;
+			return `${theme.fg("muted", STAT_LABELS[s])}:${bar}`;
 		});
 		lines.push(` ${statParts.join(" ")}`);
 
@@ -239,10 +249,11 @@ export class BuddyComponent implements Component {
 	private renderNarrow(width: number): string[] {
 		const lines: string[] = [];
 
-		// Single-line face
-		const eyes = this.state.eyeStyle;
-		const mouth = this.isPetting ? "♥" : ">";
-		const face = `${this.state.hat}${eyes}${mouth}${eyes}`;
+		// Kern uses a quiet geometric glyph instead of a face.
+		const face =
+			this.state.species === "Kern"
+				? KERN_NARROW_FRAMES[this.currentFrame % KERN_NARROW_FRAMES.length]
+				: `${this.state.hat}${this.state.eyeStyle}${this.isPetting ? "♥" : ">"}${this.state.eyeStyle}`;
 
 		// Name + truncated quip
 		const shinyMark = this.state.shiny ? "✨" : "";

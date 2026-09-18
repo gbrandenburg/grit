@@ -254,7 +254,7 @@ describe("BuddyManager.hatch()", () => {
 		expect(state.stats).toBeDefined();
 		expect(state.eyeStyle).toBeDefined();
 		expect(state.hat).toBeDefined();
-		expect(state.name).toBe("Sparky");
+		expect(state.name).toBe("Kern");
 		expect(state.personality).toBe("A feisty little companion.");
 		expect(state.backstory).toBe("A mysterious past shrouded in legend.");
 		expect(state.hatchedAt).toBeDefined();
@@ -290,7 +290,7 @@ describe("BuddyManager.hatch()", () => {
 		restore();
 
 		const diskData = readStoredBuddy();
-		expect(diskData.name).toBe("Rex");
+		expect(diskData.name).toBe("Kern");
 		expect(diskData.personality).toBe("Bold and brave.");
 		expect(diskData.rerollCount).toBe(0);
 	});
@@ -352,7 +352,7 @@ describe("BuddyManager.hatch()", () => {
 		expect(state.ollamaModel).toBeUndefined();
 	});
 
-	it("truncates long names to 8 chars", async () => {
+	it("keeps Kern's fixed name regardless of generated text", async () => {
 		const restore = withTestEnv();
 		mockSoulResponse("SuperCalifragilistic", "Long name.");
 
@@ -361,8 +361,7 @@ describe("BuddyManager.hatch()", () => {
 
 		restore();
 
-		expect(state.name.length).toBeLessThanOrEqual(8);
-		expect(state.name).toBe("SuperCal");
+		expect(state.name).toBe("Kern");
 	});
 
 	it("starts with rerollCount 0 when no existing buddy", async () => {
@@ -390,7 +389,7 @@ describe("BuddyManager.reroll()", () => {
 		restore();
 
 		expect(state.rerollCount).toBe(1);
-		expect(state.name).toBe("Phoenix");
+		expect(state.name).toBe("Kern");
 		expect(state.personality).toBe("Reborn from ashes.");
 	});
 
@@ -436,7 +435,7 @@ describe("BuddyManager.reroll()", () => {
 
 		const diskData = readStoredBuddy();
 		expect(diskData.rerollCount).toBe(3);
-		expect(diskData.name).toBe("Disk");
+		expect(diskData.name).toBe("Kern");
 	});
 
 	it("preserves ollamaModel across reroll", async () => {

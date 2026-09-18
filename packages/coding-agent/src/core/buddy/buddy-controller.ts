@@ -219,7 +219,7 @@ export class BuddyController {
 			this.callbacks.onThinkingEnd();
 			if (quip) {
 				this.reactionTimestamps.push(Date.now());
-				this.replaceContextEntry(marker, `Buddy: ${quip}`);
+				this.replaceContextEntry(marker, `Kern: ${quip}`);
 				this.callbacks.onSpeech(quip);
 			} else {
 				this.removeContextEntry(marker);
@@ -254,7 +254,7 @@ export class BuddyController {
 			thinkingEnded = true;
 			this.callbacks.onThinkingEnd();
 			if (response) {
-				this.replaceContextEntry(marker, `Buddy: ${response}`);
+				this.replaceContextEntry(marker, `Kern: ${response}`);
 				this.callbacks.onSpeech(response);
 			} else {
 				this.removeContextEntry(marker);
@@ -381,13 +381,13 @@ export class BuddyController {
 		switch (subcommand) {
 			case "pet": {
 				if (!this.manager.getState()) {
-					return { type: "warning", message: "No buddy to pet! Use /buddy to hatch one first." };
+					return { type: "warning", message: "No Kern to polish! Use /buddy to hatch Kern first." };
 				}
 				return { type: "pet" };
 			}
 			case "reroll": {
 				if (!this.manager.hasStoredBuddy()) {
-					return { type: "warning", message: "No buddy to reroll! Use /buddy to hatch one first." };
+					return { type: "warning", message: "No Kern to reforge! Use /buddy to hatch Kern first." };
 				}
 				this.callbacks.onThinkingStart();
 				try {
@@ -405,7 +405,7 @@ export class BuddyController {
 			case "stats": {
 				const state = this.manager.getState();
 				if (!state) {
-					return { type: "warning", message: "No buddy to show stats for! Use /buddy to hatch one first." };
+					return { type: "warning", message: "No Kern profile yet! Use /buddy to hatch Kern first." };
 				}
 				return { type: "stats", state };
 			}
@@ -487,7 +487,7 @@ export class BuddyController {
 
 		// "/buddy model <name>" — set the model
 		if (!this.manager.getState() && !this.manager.hasStoredBuddy()) {
-			return { type: "warning", message: "No buddy yet — hatch one first with /buddy, then set a model." };
+			return { type: "warning", message: "No Kern yet. Hatch Kern with /buddy, then set a model." };
 		}
 
 		const status = await checkOllama();
@@ -506,13 +506,13 @@ export class BuddyController {
 		}
 
 		this.manager.setOllamaModel(match);
-		return { type: "model", message: `Buddy model set to: ${match}` };
+		return { type: "model", message: `Kern model set to: ${match}` };
 	}
 
 	/** Check if an Ollama model is configured, return a nudge message if not */
 	getModelNudge(): string | null {
 		if (this.manager.getOllamaModel()) return null;
-		return "No Ollama model set — reactions are disabled. Run /buddy model to choose one.";
+		return "No Ollama model set — Kern reactions are disabled. Run /buddy model to choose one.";
 	}
 
 	// =========================================================================

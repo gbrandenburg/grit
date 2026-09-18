@@ -2,23 +2,23 @@
  * Shared types for the buddy companion system.
  */
 
-/** RPG-style stats for a companion */
+/** Grit-specific productivity stats for Kern */
 export enum Stat {
-	DEBUGGING = "DEBUGGING",
-	PATIENCE = "PATIENCE",
-	CHAOS = "CHAOS",
-	WISDOM = "WISDOM",
-	SNARK = "SNARK",
+	FOCUS = "FOCUS",
+	MOMENTUM = "MOMENTUM",
+	RESILIENCE = "RESILIENCE",
+	CLARITY = "CLARITY",
+	MISCHIEF = "MISCHIEF",
 }
 
 export const STAT_NAMES = Object.values(Stat);
 
 export interface StatBlock {
-	[Stat.DEBUGGING]: number;
-	[Stat.PATIENCE]: number;
-	[Stat.CHAOS]: number;
-	[Stat.WISDOM]: number;
-	[Stat.SNARK]: number;
+	[Stat.FOCUS]: number;
+	[Stat.MOMENTUM]: number;
+	[Stat.RESILIENCE]: number;
+	[Stat.CLARITY]: number;
+	[Stat.MISCHIEF]: number;
 }
 
 /** Rarity tiers with weights for rolling */
@@ -54,26 +54,8 @@ export const HATS = [
 	"🪖",
 ] as const;
 
-/** Species identifiers */
-export type SpeciesName =
-	| "Duck"
-	| "Goose"
-	| "Blob"
-	| "Cat"
-	| "Dragon"
-	| "Octopus"
-	| "Owl"
-	| "Penguin"
-	| "Turtle"
-	| "Snail"
-	| "Ghost"
-	| "Axolotl"
-	| "Capybara"
-	| "Cactus"
-	| "Robot"
-	| "Rabbit"
-	| "Mushroom"
-	| "Chonk";
+/** Kern's visual form identifier */
+export type SpeciesName = "Kern";
 
 /** Deterministic bones — re-rolled from hash on every session */
 export interface CompanionBones {

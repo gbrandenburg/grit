@@ -15,17 +15,17 @@ import { formatBuddySpeech, formatBuddyStats, SPECIES_EMOJI } from "../src/handl
 
 function createMockBuddyState(overrides?: Partial<BuddyState>): BuddyState {
 	return {
-		species: "Duck",
+		species: "Kern",
 		rarity: Rarity.COMMON,
 		shiny: false,
 		eyeStyle: "●",
 		hat: "",
 		stats: {
-			[Stat.DEBUGGING]: 50,
-			[Stat.PATIENCE]: 70,
-			[Stat.CHAOS]: 30,
-			[Stat.WISDOM]: 60,
-			[Stat.SNARK]: 40,
+			[Stat.FOCUS]: 50,
+			[Stat.MOMENTUM]: 70,
+			[Stat.RESILIENCE]: 30,
+			[Stat.CLARITY]: 60,
+			[Stat.MISCHIEF]: 40,
 		},
 		personality: "Cheerful and helpful.",
 		backstory: "Hatched in a Telegram chat.",
@@ -53,9 +53,9 @@ describe("formatBuddyStats", () => {
 	});
 
 	it("includes the species", () => {
-		const result = formatBuddyStats(createMockBuddyState({ species: "Cat" }));
+		const result = formatBuddyStats(createMockBuddyState({ species: "Kern" }));
 		expect(result).toContain("Species:");
-		expect(result).toContain("Cat");
+		expect(result).toContain("Kern");
 	});
 
 	it("includes the rarity", () => {
@@ -168,9 +168,10 @@ describe("formatBuddySpeech", () => {
 // ---------------------------------------------------------------------------
 
 describe("SPECIES_EMOJI", () => {
-	it("has entries for all 18 species", () => {
+	it("has entries for Kern and the legacy species", () => {
 		const keys = Object.keys(SPECIES_EMOJI);
-		expect(keys).toHaveLength(18);
+		expect(keys).toHaveLength(19);
+		expect(SPECIES_EMOJI.Kern).toBe("◈");
 	});
 
 	it("maps Duck to 🦆", () => {

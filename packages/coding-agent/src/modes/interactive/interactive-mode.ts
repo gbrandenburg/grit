@@ -470,10 +470,10 @@ export class InteractiveMode {
 			buddyCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
 				const subcommands = [
 					{ value: "model", label: "model", description: "Show or set the Ollama model for reactions" },
-					{ value: "pet", label: "pet", description: "Show your buddy some love" },
-					{ value: "reroll", label: "reroll", description: "Re-roll for a new buddy" },
-					{ value: "off", label: "off", description: "Hide your buddy" },
-					{ value: "stats", label: "stats", description: "View buddy profile" },
+					{ value: "pet", label: "pet", description: "Polish Kern's surface" },
+					{ value: "reroll", label: "reroll", description: "Reforge Kern's core" },
+					{ value: "off", label: "off", description: "Hide Kern" },
+					{ value: "stats", label: "stats", description: "View Kern's profile" },
 				];
 				const filtered = prefix ? subcommands.filter((s) => s.value.startsWith(prefix.toLowerCase())) : subcommands;
 				return filtered.length > 0 ? filtered : null;
@@ -5517,7 +5517,7 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 					this.removeBuddy();
 					this.chatContainer.addChild(new Spacer(1));
 					this.chatContainer.addChild(
-						new Text(theme.fg("muted", "Buddy hidden. Use /buddy to bring them back."), 1, 0, undefined, true),
+						new Text(theme.fg("muted", "Kern hidden. Use /buddy to bring Kern back."), 1, 0, undefined, true),
 					);
 					this.ui.requestRender();
 					break;
@@ -5547,7 +5547,7 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 				}
 			}
 		} catch (err) {
-			this.showError(`Buddy error: ${err instanceof Error ? err.message : String(err)}`);
+			this.showError(`Kern error: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
 
@@ -5622,9 +5622,9 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 		const backstory = state.backstory.replace(/\n/g, " ");
 		const lines = [
 			header,
-			theme.fg("muted", `│ Species:    `) + theme.bold(state.species),
+			theme.fg("muted", `│ Core:       `) + theme.bold(state.species),
 			theme.fg("muted", `│ Rarity:     `) + theme.fg(this.rarityColor(state.rarity), state.rarity),
-			theme.fg("muted", `│ Eyes:       ${state.eyeStyle}  Hat: ${state.hat || "none"}`),
+			theme.fg("muted", `│ Visual:     faceted graphite core`),
 			theme.fg(
 				"muted",
 				`│ Hatched:    ${state.hatchedAt ? new Date(state.hatchedAt).toLocaleDateString() : "unknown"}`,
@@ -5666,7 +5666,7 @@ ${cycleModelForward || cycleModelBackward ? `| \`${cycleModelForward}\` / \`${cy
 				new Text(
 					theme.fg(
 						"warning",
-						"⚠️ Buddy reactions require Ollama. Install it at https://ollama.com then pull a model.",
+						"⚠️ Kern reactions require Ollama. Install it at https://ollama.com then pull a model.",
 					),
 					1,
 					0,

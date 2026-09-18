@@ -48,17 +48,17 @@ function createTestController(config?: { activityGateMs?: number; reactionsPerHo
 /** A valid BuddyState for mocking hatch/reroll results */
 function createMockBuddyState(overrides?: Partial<BuddyState>): BuddyState {
 	return {
-		species: "Duck",
+		species: "Kern",
 		rarity: Rarity.COMMON,
 		shiny: false,
 		eyeStyle: "●",
 		hat: "",
 		stats: {
-			DEBUGGING: 5,
-			PATIENCE: 7,
-			CHAOS: 3,
-			WISDOM: 6,
-			SNARK: 4,
+			FOCUS: 5,
+			MOMENTUM: 7,
+			RESILIENCE: 3,
+			CLARITY: 6,
+			MISCHIEF: 4,
 		},
 		personality: "A test buddy.",
 		backstory: "Born in a test file.",
@@ -594,7 +594,7 @@ describe("context buffer", () => {
 
 		const ctx = controller.buildContext();
 		const lines = ctx.split("\n");
-		const allowedPrefixes = ["User:", "Assistant:", "Tool ", "Buddy:", "No recent activity."];
+		const allowedPrefixes = ["User:", "Assistant:", "Tool ", "Kern:", "No recent activity."];
 		for (const line of lines) {
 			const hasAllowedPrefix = allowedPrefixes.some((p) => line.startsWith(p));
 			expect(hasAllowedPrefix).toBe(true);
@@ -750,7 +750,7 @@ describe("reactions", () => {
 // Buddy self-continuity
 // ===========================================================================
 describe("buddy self-continuity", () => {
-	it("should append Buddy: entry after triggerReaction", async () => {
+	it("should append Kern: entry after triggerReaction", async () => {
 		writeStoredBuddy();
 		const { controller, manager } = createTestController();
 		manager.load();
@@ -758,10 +758,10 @@ describe("buddy self-continuity", () => {
 		vi.spyOn(manager, "react").mockResolvedValue("quip");
 
 		await controller.triggerReaction("something happened");
-		expect(controller.buildContext()).toContain("Buddy: quip");
+		expect(controller.buildContext()).toContain("Kern: quip");
 	});
 
-	it("should append Buddy: entry after handleNameCall", async () => {
+	it("should append Kern: entry after handleNameCall", async () => {
 		writeStoredBuddy();
 		const { controller, manager } = createTestController();
 		manager.load();
@@ -769,7 +769,7 @@ describe("buddy self-continuity", () => {
 		vi.spyOn(manager, "respondToNameCall").mockResolvedValue("response");
 
 		await controller.handleNameCall("Hey Testbud!");
-		expect(controller.buildContext()).toContain("Buddy: response");
+		expect(controller.buildContext()).toContain("Kern: response");
 	});
 
 	it("should include prior buddy utterances in context", async () => {
@@ -779,7 +779,7 @@ describe("buddy self-continuity", () => {
 
 		vi.spyOn(manager, "react").mockResolvedValue("first quip");
 		await controller.triggerReaction("event 1");
-		expect(controller.buildContext()).toContain("Buddy: first quip");
+		expect(controller.buildContext()).toContain("Kern: first quip");
 
 		// Clear cooldown
 		(controller as any).lastReactionTime = 0;
@@ -787,11 +787,11 @@ describe("buddy self-continuity", () => {
 		vi.spyOn(manager, "react").mockResolvedValue("second quip");
 		await controller.triggerReaction("event 2");
 		const ctx = controller.buildContext();
-		expect(ctx).toContain("Buddy: first quip");
-		expect(ctx).toContain("Buddy: second quip");
+		expect(ctx).toContain("Kern: first quip");
+		expect(ctx).toContain("Kern: second quip");
 	});
 
-	it("should append Buddy: entry even when onSpeech throws", async () => {
+	it("should append Kern: entry even when onSpeech throws", async () => {
 		writeStoredBuddy();
 		const { controller, callbacks, manager } = createTestController();
 		manager.load();
@@ -803,8 +803,8 @@ describe("buddy self-continuity", () => {
 		vi.spyOn(manager, "react").mockResolvedValue("quip");
 
 		await controller.triggerReaction("something happened");
-		// Context should still have the Buddy: entry (it was set before onSpeech)
-		expect(controller.buildContext()).toContain("Buddy: quip");
+		// Context should still have the Kern: entry (it was set before onSpeech)
+		expect(controller.buildContext()).toContain("Kern: quip");
 	});
 
 	it("should maintain causal ordering for async buddy utterances", async () => {
@@ -830,14 +830,14 @@ describe("buddy self-continuity", () => {
 		await triggerPromise;
 
 		const ctx = controller.buildContext();
-		const buddyIdx = ctx.indexOf("Buddy: quip");
+		const kernIdx = ctx.indexOf("Kern: quip");
 		const userNextIdx = ctx.indexOf("User: next");
-		// The Buddy: entry should appear BEFORE User: next because the marker
+		// The Kern: entry should appear BEFORE User: next because the marker
 		// was placed before the user message, and replaceContextEntry swapped in-place
-		expect(buddyIdx).toBeLessThan(userNextIdx);
+		expect(kernIdx).toBeLessThan(userNextIdx);
 	});
 
-	it("should append Buddy: entry even when onSpeech throws in handleNameCall", async () => {
+	it("should append Kern: entry even when onSpeech throws in handleNameCall", async () => {
 		writeStoredBuddy();
 		const { controller, callbacks, manager } = createTestController();
 		manager.load();
@@ -849,7 +849,7 @@ describe("buddy self-continuity", () => {
 		vi.spyOn(manager, "respondToNameCall").mockResolvedValue("response");
 
 		await controller.handleNameCall("Hey Testbud!");
-		expect(controller.buildContext()).toContain("Buddy: response");
+		expect(controller.buildContext()).toContain("Kern: response");
 	});
 
 	it("should handle evicted marker by appending Buddy entry at the end", async () => {
@@ -885,9 +885,9 @@ describe("buddy self-continuity", () => {
 
 		const ctx = controller.buildContext();
 		expect(ctx).not.toContain("__BUDDY_PENDING_");
-		expect(ctx).toContain("Buddy: quip");
-		// Buddy entry should be at the end since marker was evicted
-		expect(ctx.lastIndexOf("Buddy: quip")).toBeGreaterThan(ctx.indexOf("User: second"));
+		expect(ctx).toContain("Kern: quip");
+		// Kern entry should be at the end since marker was evicted
+		expect(ctx.lastIndexOf("Kern: quip")).toBeGreaterThan(ctx.indexOf("User: second"));
 	});
 });
 
@@ -1256,7 +1256,7 @@ describe("handleCommand", () => {
 		const { controller } = createTestController();
 		const result = await controller.handleCommand("pet");
 		expect(result.type).toBe("warning");
-		if (result.type === "warning") expect(result.message).toContain("No buddy to pet");
+		if (result.type === "warning") expect(result.message).toContain("No Kern to polish");
 	});
 
 	it("should return pet result when buddy exists", async () => {
@@ -1557,7 +1557,7 @@ describe("handleCommand — model", () => {
 
 		expect(result.type).toBe("model");
 		if (result.type === "model") {
-			expect(result.message).toBe("Buddy model set to: test-model:latest");
+			expect(result.message).toBe("Kern model set to: test-model:latest");
 		}
 		expect(setModelSpy).toHaveBeenCalledWith("test-model:latest");
 	});
@@ -1588,7 +1588,7 @@ describe("handleCommand — model", () => {
 
 		expect(result.type).toBe("warning");
 		if (result.type === "warning") {
-			expect(result.message).toContain("No buddy yet");
+			expect(result.message).toContain("No Kern yet");
 		}
 	});
 

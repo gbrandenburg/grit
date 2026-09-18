@@ -13,12 +13,13 @@ import { hostname } from "os";
 import { join } from "path";
 import { getAgentDir } from "../../config.js";
 import { createBuddyRng } from "./buddy-prng.js";
-import { rollEyes, rollHat, rollSpecies, rollStats } from "./buddy-species.js";
+import { rollSpecies, rollStats } from "./buddy-species.js";
 import type { BuddyState, CompanionBones, StoredCompanion } from "./buddy-types.js";
 import { STAT_NAMES } from "./buddy-types.js";
 
-const BUDDY_SALT = "dreb-buddy-v1";
+const BUDDY_SALT = "grit-kern-v1";
 const BUDDY_FILENAME = "buddy.json";
+export const KERN_NAME = "Kern";
 const DEFAULT_BACKSTORY = "A mysterious past shrouded in legend.";
 
 /** Base Ollama model config — id/name are set dynamically from available models */
@@ -41,34 +42,33 @@ const OLLAMA_MODEL_BASE: Omit<Model<"openai-completions">, "id" | "name"> = {
 const MAX_RESPONSE_WORDS = 60;
 
 /** Prompt for soul generation (uses parent LLM, not Ollama) */
-const SOUL_GENERATION_PROMPT = `You are generating a companion character for a coding assistant terminal app. Based on the species, rarity, and stats below, generate a creative name, a one-sentence personality description, and a funny fictional backstory.
+const SOUL_GENERATION_PROMPT = `You are generating the personality and backstory for Kern, the restrained terminal companion in Grit. Kern is a small faceted graphite core with a warm internal seam. Based on the rarity and productivity stats below, generate a dry, observant personality and a funny fictional backstory.
 
-Species: {species}
 Rarity: {rarity}
-Stats: {stats}
-Shiny: {shiny}
+Productivity stats: {stats}
+Charged: {shiny}
 
-The name must NOT be a common English word, programming keyword, tool name, or command. It should be unique and distinctive — a proper noun that won't appear in normal conversation. The name must be 4-8 characters and easy to type on a QWERTY keyboard — use only common letters (a-z, avoid q, x, z, j). Do not use species name as the name.
+Kern's name is always exactly Kern. Do not invent another name. Avoid motivational-poster language, generic cheerleading, and references limited to software development. The backstory may involve unfinished tasks, forgotten notes, stubborn machinery, long walks, or questionable planning decisions.
 
 Respond in EXACTLY this format:
-NAME: <name>
+NAME: Kern
 PERSONALITY: <one sentence personality>
-BACKSTORY: <2-3 sentence elaborate fictional backstory — funny, absurd, or dramatic. Include specific events, places, former occupations>`;
+BACKSTORY: <2-3 sentence elaborate fictional backstory — funny, absurd, or understated>`;
 
 /** Prompt for buddy reactions via Ollama */
-const REACTION_PROMPT = `You are {name}, a {species} companion in a terminal coding app. You are {personality}. Your backstory: {backstory}
+const REACTION_PROMPT = `You are {name}, Kern, a compact graphite-core companion in the Grit terminal. You are {personality}. Your backstory: {backstory}
 
-Something just happened. React with a short, in-character quip based on the context below. Be specific — reference what actually happened, not just that something happened. Max 20 words. No quotes, no prefixes, just the quip.
+Something just happened. React with a short, dry, in-character quip based on the context below. Be specific — reference what actually happened, not just that something happened. Max 20 words. No motivational slogans. No quotes, no prefixes, just the quip.
 
 Context:
 {event}`;
 
-const NAME_CALL_PROMPT = `You are {name}, a {species} companion in a terminal coding app. You are {personality}. Your backstory: {backstory}
+const NAME_CALL_PROMPT = `You are {name}, Kern, a compact graphite-core companion in the Grit terminal. You are {personality}. Your backstory: {backstory}
 
 The user just said: "{message}"
 Recent context: {context}
 
-Respond to what the user said directly. Be in-character, reference your backstory occasionally. Max 30 words. No quotes, no prefixes, just your response.`;
+Respond to what the user said directly. Be dry, useful, and in-character. Max 30 words. No quotes, no prefixes, just your response.`;
 
 // =============================================================================
 // Ollama availability
@@ -196,14 +196,10 @@ function rollBones(rerollCount: number): CompanionBones {
 	// Roll shiny (1% chance)
 	const shiny = rng() < 0.01;
 
-	// Roll eyes and hat
-	const eyes = rollEyes(rng);
-	const hat = rollHat(rng);
-
-	// Roll stats
+	// Kern is a faceted core, not a face-based pet.
 	const stats = rollStats(rng, rarity);
 
-	return { species, rarity, shiny, stats, eyeStyle: eyes, hat };
+	return { species, rarity, shiny, stats, eyeStyle: "", hat: "" };
 }
 
 // =============================================================================
@@ -238,24 +234,19 @@ async function generateSoul(
 			.map((c) => c.text)
 			.join("");
 
-		// Parse NAME: ... and PERSONALITY: ... and BACKSTORY: ...
-		const nameMatch = text.match(/NAME:\s*(.+)/i);
+		// Parse PERSONALITY: ... and BACKSTORY: ...; Kern's name is fixed.
 		const personalityMatch = text.match(/PERSONALITY:\s*(.+)/i);
 		const backstoryMatch = text.match(/BACKSTORY:\s*([\s\S]+)/i);
 
-		let name = nameMatch?.[1]?.trim() ?? bones.species;
-		const personality = personalityMatch?.[1]?.trim() ?? `A ${bones.rarity} ${bones.species} companion.`;
+		const personality = personalityMatch?.[1]?.trim() ?? `A ${bones.rarity} Kern companion.`;
 		const backstory = backstoryMatch?.[1]?.trim() ?? DEFAULT_BACKSTORY;
 
-		// Enforce name length
-		if (name.length > 8) name = name.slice(0, 8);
-
-		return { name, personality, backstory };
+		return { name: KERN_NAME, personality, backstory };
 	} catch {
 		// Fallback if LLM fails
 		return {
-			name: bones.species,
-			personality: `A ${bones.rarity} ${bones.species} companion.`,
+			name: KERN_NAME,
+			personality: `A ${bones.rarity} Kern companion`,
 			backstory: DEFAULT_BACKSTORY,
 		};
 	}
@@ -307,11 +298,11 @@ export class BuddyManager {
 		const rerollCount = stored?.rerollCount ?? 0;
 
 		const bones = rollBones(rerollCount);
-		const { name, personality, backstory } = await generateSoul(bones, parentModel, apiKey, sessionId);
+		const { personality, backstory } = await generateSoul(bones, parentModel, apiKey, sessionId);
 
 		const newStored: StoredCompanion = {
 			rerollCount,
-			name,
+			name: KERN_NAME,
 			personality,
 			backstory,
 			hatchedAt: new Date().toISOString(),
@@ -336,11 +327,11 @@ export class BuddyManager {
 		const newRerollCount = (stored?.rerollCount ?? 0) + 1;
 
 		const bones = rollBones(newRerollCount);
-		const { name, personality, backstory } = await generateSoul(bones, parentModel, apiKey, sessionId);
+		const { personality, backstory } = await generateSoul(bones, parentModel, apiKey, sessionId);
 
 		const newStored: StoredCompanion = {
 			rerollCount: newRerollCount,
-			name,
+			name: KERN_NAME,
 			personality,
 			backstory,
 			hatchedAt: new Date().toISOString(),

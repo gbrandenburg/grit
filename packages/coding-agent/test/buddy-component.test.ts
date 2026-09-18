@@ -28,22 +28,22 @@ const mockUI = { requestRender: mockRequestRender } as any;
 /** Helper to create a test buddy state */
 function createTestState(overrides: Partial<BuddyState> = {}): BuddyState {
 	return {
-		species: "Duck",
+		species: "Kern",
 		rarity: Rarity.COMMON,
 		shiny: false,
 		stats: {
-			[Stat.DEBUGGING]: 50,
-			[Stat.PATIENCE]: 60,
-			[Stat.CHAOS]: 40,
-			[Stat.WISDOM]: 70,
-			[Stat.SNARK]: 30,
+			[Stat.FOCUS]: 50,
+			[Stat.MOMENTUM]: 60,
+			[Stat.RESILIENCE]: 40,
+			[Stat.CLARITY]: 70,
+			[Stat.MISCHIEF]: 30,
 		},
 		eyeStyle: "●",
 		hat: "",
 		rerollCount: 0,
-		name: "TestDuck",
-		personality: "A test duck.",
-		backstory: "Once ruled a pond empire.",
+		name: "Kern",
+		personality: "A test core.",
+		backstory: "Once guarded a drawer of unfinished notes.",
 		hatchedAt: new Date().toISOString(),
 		...overrides,
 	};
@@ -69,7 +69,7 @@ describe("BuddyComponent", () => {
 			expect(lines.length).toBeGreaterThan(0);
 			// Should contain buddy name (bold-wrapped)
 			const joined = lines.join("\n");
-			expect(joined).toContain("TestDuck");
+			expect(joined).toContain("Kern");
 		});
 
 		it("returns shorter output for narrow terminal", () => {
@@ -151,9 +151,9 @@ describe("BuddyComponent", () => {
 			const lines = comp.render(120);
 			comp.dispose();
 
-			// At least one line should have both sprite content (●● from Duck eyeStyle) and bubble border (│)
+			// At least one line should have both Kern sketch content and bubble border (│)
 			const sideBySideLines = lines.filter(
-				(l) => l.includes("│") && (l.includes("●●") || l.includes("╭") || l.includes("╰")),
+				(l) => l.includes("│") && (l.includes("####") || l.includes("╭") || l.includes("╰")),
 			);
 			expect(sideBySideLines.length).toBeGreaterThan(0);
 		});
@@ -211,14 +211,14 @@ describe("BuddyComponent", () => {
 	});
 
 	describe("updateState()", () => {
-		it("updates rendering with new species", () => {
-			const state = createTestState({ species: "Duck", name: "TestDuck" });
+		it("updates rendering with Kern state", () => {
+			const state = createTestState({ species: "Kern", name: "Kern" });
 			const comp = new BuddyComponent(mockUI, state);
 			// Initial render
 			comp.render(120);
 
-			// Update to Cat
-			const newState = createTestState({ species: "Cat", name: "TestCat" });
+			// Update to a refreshed Kern state
+			const newState = createTestState({ species: "Kern", name: "Kern" });
 			comp.updateState(newState);
 
 			expect(mockRequestRender).toHaveBeenCalled();
@@ -226,7 +226,7 @@ describe("BuddyComponent", () => {
 			comp.dispose();
 
 			const joined = lines.join("\n");
-			expect(joined).toContain("Cat");
+			expect(joined).toContain("Kern");
 		});
 	});
 

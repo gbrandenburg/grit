@@ -17,34 +17,12 @@ import {
 import { Rarity } from "../src/core/buddy/buddy-types.js";
 
 describe("ALL_SPECIES", () => {
-	it("has exactly 18 species", () => {
-		expect(ALL_SPECIES).toHaveLength(18);
+	it("has exactly one species", () => {
+		expect(ALL_SPECIES).toEqual(["Kern"]);
 	});
 
-	it("contains all expected species", () => {
-		const expected = [
-			"Duck",
-			"Goose",
-			"Blob",
-			"Cat",
-			"Dragon",
-			"Octopus",
-			"Owl",
-			"Penguin",
-			"Turtle",
-			"Snail",
-			"Ghost",
-			"Axolotl",
-			"Capybara",
-			"Cactus",
-			"Robot",
-			"Rabbit",
-			"Mushroom",
-			"Chonk",
-		];
-		for (const s of expected) {
-			expect(ALL_SPECIES).toContain(s);
-		}
+	it("contains Kern", () => {
+		expect(ALL_SPECIES).toContain("Kern");
 	});
 
 	it("has no duplicates", () => {
@@ -103,15 +81,14 @@ describe("rollSpecies", () => {
 		}
 	});
 
-	it("produces different species over many rolls", () => {
+	it("keeps Kern stable over many rolls", () => {
 		const rng = mulberry32(42);
 		const speciesSet = new Set<string>();
 		for (let i = 0; i < 200; i++) {
 			const { species } = rollSpecies(rng);
 			speciesSet.add(species);
 		}
-		// Should see at least 3 different species over 200 rolls
-		expect(speciesSet.size).toBeGreaterThanOrEqual(3);
+		expect(speciesSet).toEqual(new Set(["Kern"]));
 	});
 });
 
@@ -139,11 +116,11 @@ describe("rollStats", () => {
 	it("returns all 5 stats", () => {
 		const rng = mulberry32(42);
 		const stats = rollStats(rng, Rarity.COMMON);
-		expect(stats.DEBUGGING).toBeDefined();
-		expect(stats.PATIENCE).toBeDefined();
-		expect(stats.CHAOS).toBeDefined();
-		expect(stats.WISDOM).toBeDefined();
-		expect(stats.SNARK).toBeDefined();
+		expect(stats.FOCUS).toBeDefined();
+		expect(stats.MOMENTUM).toBeDefined();
+		expect(stats.RESILIENCE).toBeDefined();
+		expect(stats.CLARITY).toBeDefined();
+		expect(stats.MISCHIEF).toBeDefined();
 	});
 
 	it("all stats are between 0 and 100", () => {
