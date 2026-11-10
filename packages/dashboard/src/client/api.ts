@@ -113,7 +113,8 @@ export const api = {
 	devices: () => request<{ devices: PairedDeviceDto[] }>("/api/devices"),
 	unpair: (id: string) => request<{ ok: true }>(`/api/devices/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
-	fleet: () => request<FleetDto>("/api/fleet"),
+	// Initial UI load must not wait for the expensive historical-session inventory.
+	fleet: () => request<FleetDto>("/api/fleet/live"),
 	sessions: () => request<SessionInventoryDto>("/api/sessions"),
 	resync: (key?: string, agentId?: string, signal?: AbortSignal) => {
 		const query = new URLSearchParams();
@@ -185,6 +186,11 @@ export const api = {
 		),
 	steerSubagent: (key: string, agentId: string, message: string) =>
 		request<{ ok: true }>(`/api/runtimes/${key}/subagents/${encodeURIComponent(agentId)}/steer`, json({ message })),
+	/** Stop exactly this background agent; the parent session and siblings keep running. */
+	abortSubagent: (key: string, agentId: string) =>
+		request<{ ok: true }>(`/api/runtimes/${key}/subagents/${encodeURIComponent(agentId)}/abort`, {
+			method: "POST",
+		}),
 	extensionUiResponse: (key: string, response: Record<string, unknown>) =>
 		request<{ ok: true }>(`/api/runtimes/${key}/extension-ui-response`, json(response)),
 	exportHtmlUrl: (key: string) => `/api/runtimes/${key}/export-html`,
@@ -195,6 +201,12 @@ export const api = {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ path }),
 		}),
+	/** Rename a past session by file path (routed to its runtime when one holds it). */
+	renameDiskSession: (path: string, name: string) =>
+		request<{ name: string }>("/api/sessions/rename", json({ path, name })),
+	/** Ask the tab-title generator for a title for a saved session; the file is not modified. */
+	generateSessionTitle: (path: string, signal?: AbortSignal) =>
+		request<{ title: string }>("/api/sessions/title", { ...json({ path }), signal }),
 
 	settings: (cwd?: string) => request<SettingsDto>(withCwd("/api/settings", cwd)),
 	saveSettings: (settings: SettingsUpdateDto, cwd?: string) =>
@@ -214,7 +226,7 @@ export const api = {
 			"/api/server/info",
 		),
 	restartServer: () => request<{ ok: true; restarting: boolean }>("/api/server/restart", { method: "POST" }),
-	dailyCost: () => request<{ cost: number }>("/api/daily-cost"),
+	dailyCost: () => request<{ cost: number; main: number; subagent: number }>("/api/daily-cost"),
 
 	listFiles: (path: string) => request<DirListingDto>(`/api/files?path=${encodeURIComponent(path)}`),
 	trustContextFolder: (path: string) => request<ContextTrustMutationResultDto>("/api/files/trust", json({ path })),

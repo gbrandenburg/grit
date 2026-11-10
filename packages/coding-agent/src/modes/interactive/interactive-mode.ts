@@ -43,6 +43,7 @@ import { BuddyManager, checkOllama } from "../../core/buddy/buddy-manager.js";
 import { Rarity, Stat } from "../../core/buddy/buddy-types.js";
 import { BuddyController } from "../../core/buddy/index.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
+import { dailyCostSourcesForSession } from "../../core/daily-cost-tracker.js";
 import { formatDispatchArbitrationRecord } from "../../core/dispatch-arbiter.js";
 import {
 	acquireDreamLock,
@@ -352,7 +353,7 @@ export class InteractiveMode {
 		this.editor = this.defaultEditor;
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
-		this.footerDataProvider = new FooterDataProvider();
+		this.footerDataProvider = new FooterDataProvider(dailyCostSourcesForSession(session));
 		this.footer = new FooterComponent(session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(session.autoCompactionEnabled);
 
@@ -2912,8 +2913,13 @@ export class InteractiveMode {
 				break;
 			}
 
-			case "background_agent_start":
+			case "background_agent_start": {
+				this.updateBackgroundAgentStatus();
+				break;
+			}
+
 			case "background_agent_end": {
+				await this.footerDataProvider.refreshSubagentSessionCost();
 				this.updateBackgroundAgentStatus();
 				break;
 			}
@@ -3857,11 +3863,15 @@ export class InteractiveMode {
 				this.showError(`Dispatch Arbiter model "${settings.model}" is not available.`);
 				return false;
 			}
-			const thinking = settings.thinking ?? "off";
-			const thinkingValidation = validateThinkingLevelForModel(arbiterModel, thinking);
-			if (!thinkingValidation.ok) {
-				this.showError(thinkingValidation.error);
-				return false;
+			// Only an explicit thinking level is validated. When unset, the arbiter sends no
+			// reasoning and the provider applies the model's thinking-off config (matches RPC
+			// and the runtime arbiter).
+			if (settings.thinking !== undefined) {
+				const thinkingValidation = validateThinkingLevelForModel(arbiterModel, settings.thinking);
+				if (!thinkingValidation.ok) {
+					this.showError(thinkingValidation.error);
+					return false;
+				}
 			}
 			try {
 				loadAndValidateModelRoutingGuide(

@@ -8,7 +8,9 @@ import { createExtensionRuntime } from "../src/core/extensions/loader.js";
 import { getGitBranch } from "../src/core/git-branch.js";
 import * as outputGuard from "../src/core/output-guard.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+import { SubagentSessionCostTracker } from "../src/core/subagent-session-cost-tracker.js";
 import type { TabTitleDeps } from "../src/core/tab-title.js";
+import { abortBackgroundAgent } from "../src/core/tools/subagent.js";
 import type {
 	RpcDashboardSnapshot as AggregateRpcDashboardSnapshot,
 	RpcEvent as AggregateRpcEvent,
@@ -33,6 +35,13 @@ import {
 	runRpcMode,
 } from "../src/modes/rpc/rpc-mode.js";
 import { createTestResourceLoader, createTestSession } from "./utilities.js";
+
+// Pass-through wrapper so dispatcher tests can assert the single-agent stop target
+// without launching a real child; the real implementation runs by default.
+vi.mock("../src/core/tools/subagent.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/core/tools/subagent.js")>();
+	return { ...actual, abortBackgroundAgent: vi.fn(actual.abortBackgroundAgent) };
+});
 
 const capturedTabTitleDeps = vi.hoisted(() => [] as TabTitleDeps[]);
 
@@ -88,9 +97,10 @@ function acceptRpcEventListener(listener: RpcEventListener): RpcEventListener {
 	return listener;
 }
 
-async function dispatchRpcCommand(
+async function dispatchRpcCommands(
 	session: ReturnType<typeof createTestSession>["session"],
-	command: Record<string, unknown>,
+	commands: Array<Record<string, unknown>>,
+	beforeCommand?: (index: number) => void,
 ): Promise<Array<Record<string, unknown>>> {
 	const outputs: Array<Record<string, unknown>> = [];
 	let handleInputLine: ((line: string) => void) | undefined;
@@ -108,8 +118,11 @@ async function dispatchRpcCommand(
 	try {
 		void runRpcMode(session);
 		await vi.waitFor(() => expect(handleInputLine).toBeDefined());
-		handleInputLine!(JSON.stringify(command));
-		await vi.waitFor(() => expect(outputs).toHaveLength(1));
+		for (const [index, command] of commands.entries()) {
+			beforeCommand?.(index);
+			handleInputLine!(JSON.stringify(command));
+			await vi.waitFor(() => expect(outputs.some((output) => output.id === command.id)).toBe(true));
+		}
 		return outputs;
 	} finally {
 		for (const listener of process.stdin.listeners("end")) {
@@ -121,6 +134,13 @@ async function dispatchRpcCommand(
 			}
 		}
 	}
+}
+
+async function dispatchRpcCommand(
+	session: ReturnType<typeof createTestSession>["session"],
+	command: Record<string, unknown>,
+): Promise<Array<Record<string, unknown>>> {
+	return dispatchRpcCommands(session, [command]);
 }
 
 describe("RPC dashboard state/resources DTOs", () => {
@@ -193,6 +213,68 @@ describe("RPC dashboard state/resources DTOs", () => {
 
 			expect(isUsingOAuth).toHaveBeenCalledWith(session.model);
 			expect(state.usingSubscription).toBe(true);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("primes sub-agent cost before the first get_session_stats response", async () => {
+		const { session, cleanup } = createTestSession({ inMemory: true });
+		let primed = false;
+		const refresh = vi.spyOn(SubagentSessionCostTracker.prototype, "refresh").mockImplementation(async () => {
+			await Promise.resolve();
+			primed = true;
+		});
+		vi.spyOn(SubagentSessionCostTracker.prototype, "getCost").mockImplementation(() => (primed ? 0.73 : 0));
+
+		try {
+			const outputs = await dispatchRpcCommand(session, { id: "first-stats", type: "get_session_stats" });
+
+			expect(refresh).toHaveBeenCalledOnce();
+			expect(outputs[0]).toMatchObject({
+				id: "first-stats",
+				success: true,
+				data: { subagentCost: 0.73 },
+			});
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("refreshes sub-agent cost after a background agent completes", async () => {
+		const { session, cleanup } = createTestSession({ inMemory: true });
+		let refreshCount = 0;
+		const refresh = vi.spyOn(SubagentSessionCostTracker.prototype, "refresh").mockImplementation(async () => {
+			refreshCount++;
+		});
+		vi.spyOn(SubagentSessionCostTracker.prototype, "getCost").mockImplementation(() => refreshCount);
+
+		try {
+			const outputs = await dispatchRpcCommands(
+				session,
+				[
+					{ id: "before-agent", type: "get_session_stats" },
+					{ id: "after-agent", type: "get_session_stats" },
+				],
+				(index) => {
+					if (index === 1) {
+						(session as unknown as { _emit: (event: Record<string, unknown>) => void })._emit({
+							type: "background_agent_end",
+							agentId: "agent-1",
+							agentType: "Explore",
+							success: true,
+						});
+					}
+				},
+			);
+
+			expect(refresh).toHaveBeenCalledTimes(2);
+			expect(outputs.find((output) => output.id === "before-agent")).toMatchObject({
+				data: { subagentCost: 1 },
+			});
+			expect(outputs.find((output) => output.id === "after-agent")).toMatchObject({
+				data: { subagentCost: 2 },
+			});
 		} finally {
 			cleanup();
 		}
@@ -396,6 +478,50 @@ describe("runRpcMode dashboard dispatcher", () => {
 			await expect(session.newSession()).resolves.toBe(true);
 			expect(sessionManager.getHeader()?.cwd).toBe(tempDir);
 			expect(sessionManager.getCwd()).toBe(tempDir);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("abort_background_agent stops only the requested agent", async () => {
+		const { session, cleanup } = createTestSession({ inMemory: true });
+		vi.mocked(abortBackgroundAgent).mockImplementationOnce(() => {});
+		const abortSpy = vi.spyOn(session, "abort");
+
+		try {
+			const outputs = await dispatchRpcCommand(session, {
+				id: "stop-one",
+				type: "abort_background_agent",
+				agentId: "bg-target",
+			});
+			expect(outputs.find((output) => output.id === "stop-one")).toMatchObject({
+				type: "response",
+				command: "abort_background_agent",
+				success: true,
+			});
+			expect(abortBackgroundAgent).toHaveBeenCalledWith("bg-target");
+			// The parent run is not aborted (unlike the session-wide `abort` command).
+			expect(abortSpy).not.toHaveBeenCalled();
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("abort_background_agent fails loudly for an unknown agent", async () => {
+		const { session, cleanup } = createTestSession({ inMemory: true });
+
+		try {
+			const outputs = await dispatchRpcCommand(session, {
+				id: "stop-unknown",
+				type: "abort_background_agent",
+				agentId: "no-such-agent",
+			});
+			expect(outputs.find((output) => output.id === "stop-unknown")).toMatchObject({
+				type: "response",
+				command: "abort_background_agent",
+				success: false,
+				error: expect.stringContaining('Unknown background agent "no-such-agent"'),
+			});
 		} finally {
 			cleanup();
 		}
@@ -838,16 +964,16 @@ describe("RpcClient dashboard command methods", () => {
 		expect(client.send).toHaveBeenCalledWith({ type: "get_git_branch" });
 	});
 
-	it("getDailyCost sends get_daily_cost and unwraps the cost", async () => {
+	it("getDailyCost sends get_daily_cost and unwraps the cost breakdown", async () => {
 		const client = new RpcClient() as any;
 		client.send = vi.fn().mockResolvedValue({
 			type: "response",
 			command: "get_daily_cost",
 			success: true,
-			data: { cost: 1.23 },
+			data: { cost: 1.23, main: 0.73, subagent: 0.5 },
 		});
 
-		await expect(client.getDailyCost()).resolves.toBe(1.23);
+		await expect(client.getDailyCost()).resolves.toEqual({ cost: 1.23, main: 0.73, subagent: 0.5 });
 		expect(client.send).toHaveBeenCalledWith({ type: "get_daily_cost" });
 	});
 

@@ -1,6 +1,18 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, type Dirent, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
+import {
+	closeSync,
+	type Dirent,
+	existsSync,
+	mkdirSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	realpathSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import type { AgentTool, ThinkingLevel } from "@dreb/agent-core";
@@ -175,7 +187,17 @@ export interface SubagentResult {
 	/** Ordered effective metadata for chain steps. */
 	steps?: SubagentStepMetadata[];
 	exitCode: number;
+	/**
+	 * The child agent's own text output (its assistant messages), without system notes.
+	 * For a chain (`steps` set) this is instead the composed per-step report from
+	 * `formatSingleResult`, in which each step's output is already delimited.
+	 */
 	output: string;
+	/**
+	 * System notes about how the run was routed (ignored model-selection warnings, model
+	 * fallback summaries). Rendered before, and outside, the agent-output block.
+	 */
+	notes?: string[];
 	stderr: string;
 	errorMessage: string | null;
 	/** Path to the persisted session JSONL file, if available */
@@ -187,6 +209,19 @@ export interface SubagentResult {
 // and process.argv[1] may return corrupted or truncated data.
 const DREB_SCRIPT = process.argv[1] || "dreb";
 const NODE_EXEC = process.execPath;
+
+/**
+ * Whether RPC-controlled subagent children should emit legacy full
+ * message_update frames. Set by an RPC host started with
+ * --rpc-full-message-updates so nested background_agent_event payloads relayed
+ * from children match the parent's opt-in (issue 535). Children launched with
+ * the flag set it again in their own process, so it propagates to every depth.
+ */
+let subagentRpcFullMessageUpdates = false;
+
+export function setSubagentRpcFullMessageUpdates(enabled: boolean): void {
+	subagentRpcFullMessageUpdates = enabled;
+}
 
 // Tools that must never be available to subagents — wait (subagents should
 // never no-op; they have a task to complete), watch_github_ci (parent workflow
@@ -331,6 +366,14 @@ export function handleChildJsonlLine(line: string, sinks: ChildLineSinks): void 
 	}
 }
 
+/**
+ * How long a gracefully aborted (RPC `abort`) child may take to finish its run and
+ * emit `agent_end` before it is terminated with SIGTERM.
+ */
+export const SUBAGENT_ABORT_GRACE_MS = 5000;
+/** Delay between SIGTERM and the SIGKILL backstop for a child that is still alive. */
+export const SUBAGENT_SIGKILL_BACKSTOP_MS = 5000;
+
 async function spawnSubagent(
 	agentConfig: AgentTypeConfig,
 	task: string,
@@ -398,6 +441,7 @@ async function spawnSubagent(
 		const rpcModeIndex = args.indexOf("json");
 		if (rpcModeIndex !== -1) args[rpcModeIndex] = "rpc";
 		args.splice(args.length - 2, 2);
+		if (subagentRpcFullMessageUpdates) args.push("--rpc-full-message-updates");
 	}
 
 	// Early abort check — if the signal is already aborted (e.g. queued task whose
@@ -430,6 +474,7 @@ async function spawnSubagent(
 
 		let settled = false;
 		let killTimer: ReturnType<typeof setTimeout> | null = null;
+		let abortGraceTimer: ReturnType<typeof setTimeout> | null = null;
 		const collectedMessages: Array<{ role: string; content: any[] }> = [];
 		const stderrChunks: string[] = [];
 		let stderrSize = 0;
@@ -440,6 +485,8 @@ async function spawnSubagent(
 		let resolvedThinking: ThinkingLevel | undefined;
 		let rpcRequestId = 0;
 		let rpcCompleted = false;
+		/** Set once a graceful RPC `abort` has been sent for a user stop. */
+		let gracefulAbortRequested = false;
 		let controlError: Error | undefined;
 		const pendingRpc = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
 		const sendRpc = <T>(command: Record<string, unknown>): Promise<T> => {
@@ -458,6 +505,26 @@ async function spawnSubagent(
 				} as RpcClient)
 			: undefined;
 
+		// Escalating termination: SIGTERM now, SIGKILL if the process is still alive
+		// after the backstop delay. Liveness is judged by exitCode/signalCode —
+		// `proc.killed` only reports that a signal was *sent*, so it is already true
+		// after the SIGTERM and cannot gate the SIGKILL escalation.
+		const forceKill = () => {
+			try {
+				proc.kill("SIGTERM");
+			} catch {
+				/* process already exited */
+			}
+			killTimer ??= setTimeout(() => {
+				if (proc.exitCode !== null || proc.signalCode !== null) return;
+				try {
+					proc.kill("SIGKILL");
+				} catch {
+					/* process already exited */
+				}
+			}, SUBAGENT_SIGKILL_BACKSTOP_MS);
+		};
+
 		// Terminally fail a controlled child: remember the first failure, reject all
 		// in-flight control requests, and stop the process (with the same SIGKILL
 		// backstop as the abort path) so the close handler settles instead of the
@@ -466,18 +533,23 @@ async function spawnSubagent(
 			if (!controlError) controlError = err;
 			for (const request of pendingRpc.values()) request.reject(err);
 			pendingRpc.clear();
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* process already exited */
+			forceKill();
+		};
+
+		// Ask a controlled child to abort its own run (graceful stop). If the request cannot
+		// be delivered or the child refuses it, terminate the child instead.
+		const requestGracefulAbort = () => {
+			if (!proc.stdin?.writable) {
+				forceKill();
+				return;
 			}
-			killTimer ??= setTimeout(() => {
-				try {
-					if (!proc.killed) proc.kill("SIGKILL");
-				} catch {
-					/* process already exited */
-				}
-			}, 5000);
+			sendRpc({ type: "abort" }).catch((err) => {
+				if (settled) return;
+				log.warn(
+					`[subagent] graceful abort failed (agent=${agentConfig.name}): ${err instanceof Error ? err.message : String(err)}; terminating child`,
+				);
+				forceKill();
+			});
 		};
 
 		proc.stdin?.on("error", (err) => {
@@ -508,7 +580,17 @@ async function spawnSubagent(
 						const message = JSON.parse(line);
 						if (message?.type === "agent_end" && !rpcCompleted) {
 							rpcCompleted = true;
-							setImmediate(() => proc.kill("SIGTERM"));
+							setImmediate(forceKill);
+						}
+						if (message?.type === "agent_start" && gracefulAbortRequested && !rpcCompleted) {
+							// The child handles commands concurrently. An abort that arrived while
+							// its initial prompt was still in its pre-run preamble (API-key
+							// resolution, input/before-start hooks) was acknowledged without
+							// aborting anything, because no run existed yet. Abort the run that
+							// has now started, before it can execute tools the user just stopped.
+							// Otherwise it would keep working until the grace period expires, and
+							// SIGTERM would orphan any tool process tree it had started.
+							requestGracefulAbort();
 						}
 						if (message?.type === "response" && typeof message.id === "string") {
 							const pending = pendingRpc.get(message.id);
@@ -558,20 +640,22 @@ async function spawnSubagent(
 			});
 		}
 
-		// Handle abort signal (guard kill() against ESRCH race if process already exited)
+		// Handle abort signal (user stop / stop-all). A controlled child is stopped
+		// gracefully first: the RPC `abort` makes the child abort its own run, so its
+		// tools unwind — notably the bash tool kills its detached process group on its
+		// abort signal, which a bare SIGTERM to this child would orphan. The child's
+		// resulting agent_end triggers the normal SIGTERM above; a run that starts only
+		// after the abort was handled is aborted again on its agent_start. If the abort
+		// cannot be delivered or the child does not finish within the grace period,
+		// escalate to SIGTERM and then the SIGKILL backstop.
 		const onAbort = () => {
-			try {
-				proc.kill("SIGTERM");
-			} catch {
-				/* process already exited */
+			if (!controlClient || rpcCompleted || controlError || !proc.stdin?.writable) {
+				forceKill();
+				return;
 			}
-			killTimer = setTimeout(() => {
-				try {
-					if (!proc.killed) proc.kill("SIGKILL");
-				} catch {
-					/* process already exited */
-				}
-			}, 5000);
+			gracefulAbortRequested = true;
+			abortGraceTimer ??= setTimeout(forceKill, SUBAGENT_ABORT_GRACE_MS);
+			requestGracefulAbort();
 		};
 		signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -582,6 +666,7 @@ async function spawnSubagent(
 			for (const request of pendingRpc.values()) request.reject(err);
 			pendingRpc.clear();
 			if (killTimer) clearTimeout(killTimer);
+			if (abortGraceTimer) clearTimeout(abortGraceTimer);
 			signal?.removeEventListener("abort", onAbort);
 			rejectPromise(new Error(`Subagent process error: ${err.message}`));
 		});
@@ -593,6 +678,7 @@ async function spawnSubagent(
 			for (const request of pendingRpc.values()) request.reject(new Error("Subagent process exited."));
 			pendingRpc.clear();
 			if (killTimer) clearTimeout(killTimer);
+			if (abortGraceTimer) clearTimeout(abortGraceTimer);
 			signal?.removeEventListener("abort", onAbort);
 			const exitCode = rpcCompleted ? 0 : (code ?? 1);
 			const stderr = stderrChunks.join("");
@@ -682,7 +768,7 @@ interface SessionFileCandidate {
 
 const STEP_SESSION_DIR_RE = /^step-(\d+)$/;
 
-function findNewestJsonlFileInDir(dir: string): SessionFileCandidate | undefined {
+function findNewestJsonlFileInDir(dir: string, throwOnOperationalError = false): SessionFileCandidate | undefined {
 	let best: SessionFileCandidate | undefined;
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
 		if (!entry.name.endsWith(".jsonl")) continue;
@@ -692,14 +778,17 @@ function findNewestJsonlFileInDir(dir: string): SessionFileCandidate | undefined
 			const mtime = statSync(fullPath).mtime.getTime();
 			if (!best || mtime > best.mtime) best = { path: fullPath, mtime };
 		} catch (err) {
-			if (isExpectedFilesystemError(err)) continue;
+			if (isExpectedFilesystemError(err) && (!throwOnOperationalError || isMissingFilesystemError(err))) continue;
 			throw err;
 		}
 	}
 	return best;
 }
 
-function discoverStepSessionFileCandidates(sessionDir: string): SessionFileCandidate[] {
+function discoverStepSessionFileCandidates(
+	sessionDir: string,
+	throwOnOperationalError = false,
+): SessionFileCandidate[] {
 	const steps: Array<{ name: string; index: number }> = [];
 	for (const entry of readdirSync(sessionDir, { withFileTypes: true })) {
 		if (!entry.isDirectory()) continue;
@@ -712,10 +801,10 @@ function discoverStepSessionFileCandidates(sessionDir: string): SessionFileCandi
 	const files: SessionFileCandidate[] = [];
 	for (const step of steps) {
 		try {
-			const candidate = findNewestJsonlFileInDir(join(sessionDir, step.name));
+			const candidate = findNewestJsonlFileInDir(join(sessionDir, step.name), throwOnOperationalError);
 			if (candidate) files.push(candidate);
 		} catch (err) {
-			if (isExpectedFilesystemError(err)) continue;
+			if (isExpectedFilesystemError(err) && (!throwOnOperationalError || isMissingFilesystemError(err))) continue;
 			throw err;
 		}
 	}
@@ -731,16 +820,21 @@ function discoverStepSessionFileCandidates(sessionDir: string): SessionFileCandi
  * present this recurses one level into step-* directories and returns one file
  * per step in numeric step order.
  */
-export function discoverSessionFiles(sessionDir: string, agentName: string): string[] {
+export function discoverSessionFiles(
+	sessionDir: string,
+	agentName: string,
+	options: { throwOnOperationalError?: boolean } = {},
+): string[] {
+	const throwOnOperationalError = options.throwOnOperationalError ?? false;
 	try {
-		if (!existsSync(sessionDir)) return [];
-		const flatFile = findNewestJsonlFileInDir(sessionDir);
+		if (!throwOnOperationalError && !existsSync(sessionDir)) return [];
+		const flatFile = findNewestJsonlFileInDir(sessionDir, throwOnOperationalError);
 		if (flatFile) {
 			log.debug(`[subagent] session file: ${flatFile.path} (agent=${agentName})`);
 			return [flatFile.path];
 		}
 
-		const stepFiles = discoverStepSessionFileCandidates(sessionDir);
+		const stepFiles = discoverStepSessionFileCandidates(sessionDir, throwOnOperationalError);
 		if (stepFiles.length > 0) {
 			log.debug(
 				`[subagent] chain session files: ${stepFiles.map((file) => file.path).join(", ")} (agent=${agentName})`,
@@ -748,6 +842,10 @@ export function discoverSessionFiles(sessionDir: string, agentName: string): str
 			return stepFiles.map((file) => file.path);
 		}
 	} catch (err) {
+		if (throwOnOperationalError) {
+			if (isMissingFilesystemError(err)) return [];
+			throw err;
+		}
 		if (!isExpectedFilesystemError(err)) throw err;
 		log.warn(
 			`[subagent] failed to discover session file (agent=${agentName}): ${err instanceof Error ? err.message : String(err)}`,
@@ -1088,16 +1186,6 @@ export function formatModelFallbackSummary(
 	return `[MODEL FALLBACK: skipped ${skippedModels.length} unavailable model(s); ${routeSummary}]\n${skipped}`;
 }
 
-export function prependModelFallbackSummary(
-	output: string,
-	skippedModels: SkippedFallbackModel[],
-	proposalModel: string | undefined,
-	finalModel?: string,
-): string {
-	const fallbackSummary = formatModelFallbackSummary(skippedModels, proposalModel, finalModel);
-	return fallbackSummary ? `${fallbackSummary}\n\n${output}` : output;
-}
-
 function formatSkippedModelFailureDetails(skippedModels: SkippedFallbackModel[]): string | undefined {
 	if (skippedModels.length === 0) return undefined;
 	return `Skipped models:\n${skippedModels.map((s) => `- ${s.model}: ${s.reason}`).join("\n")}`;
@@ -1112,10 +1200,22 @@ const MAX_TASK_LENGTH = 32_768; // 32 KB — prevent E2BIG from oversized argv
  * running-child count even when its tool definitions are rebuilt (e.g. on `/reload`).
  */
 export interface SubagentConcurrencyGate {
-	/** Resolves immediately if a slot is free, otherwise queues until one is released. */
-	acquire(): Promise<void>;
+	/**
+	 * Resolves immediately if a slot is free, otherwise queues until one is released.
+	 * When `signal` aborts before a slot is granted, the waiter is removed and the
+	 * promise rejects without taking a slot (the caller must not `release()`).
+	 */
+	acquire(signal?: AbortSignal): Promise<void>;
 	/** Returns a slot and wakes the next waiter, if any. */
 	release(): void;
+}
+
+/** Thrown by {@link SubagentConcurrencyGate.acquire} when its signal aborts before a slot is granted. */
+export class SubagentSlotWaitAbortedError extends Error {
+	constructor() {
+		super("Cancelled while waiting for a subagent concurrency slot.");
+		this.name = "SubagentSlotWaitAbortedError";
+	}
 }
 
 /**
@@ -1130,16 +1230,25 @@ export function createSubagentConcurrencyGate(maxConcurrent: number): SubagentCo
 	let running = 0;
 	const waiters: Array<() => void> = [];
 	return {
-		acquire(): Promise<void> {
+		acquire(signal?: AbortSignal): Promise<void> {
+			if (signal?.aborted) return Promise.reject(new SubagentSlotWaitAbortedError());
 			if (running < maxConcurrent) {
 				running++;
 				return Promise.resolve();
 			}
-			return new Promise<void>((resolve) => {
-				waiters.push(() => {
+			return new Promise<void>((resolve, reject) => {
+				const grant = () => {
+					signal?.removeEventListener("abort", onAbort);
 					running++;
 					resolve();
-				});
+				};
+				const onAbort = () => {
+					const index = waiters.indexOf(grant);
+					if (index !== -1) waiters.splice(index, 1);
+					reject(new SubagentSlotWaitAbortedError());
+				};
+				waiters.push(grant);
+				signal?.addEventListener("abort", onAbort, { once: true });
 			});
 		},
 		release(): void {
@@ -1505,16 +1614,21 @@ export async function executeSingle(
 		onControlAvailable,
 	);
 	const finalSelectedModel = result.model ?? (usedModel ? canonicalModelRef(resolvedProvider, usedModel) : undefined);
-	result.output = prependModelFallbackSummary(
-		result.output,
+	// Spawn-time routing notes are system text, not the child's words: keep them out of
+	// `output` so the parent sees them outside the agent-output block (and so a chain's
+	// `{previous}` carries only the previous agent's output).
+	const notes: string[] = [];
+	if (warning) {
+		const warningContext = arbitrationEnabled ? `Proposal resolution: ${warning}` : warning;
+		notes.push(`[WARNING: ${warningContext}]`);
+	}
+	const fallbackSummary = formatModelFallbackSummary(
 		skippedModels,
 		arbitrationEnabled ? proposalSelectedModel : finalSelectedModel,
 		arbitrationEnabled ? finalSelectedModel : undefined,
 	);
-	if (warning) {
-		const warningContext = arbitrationEnabled ? `Proposal resolution: ${warning}` : warning;
-		result.output = `[WARNING: ${warningContext}]\n\n${result.output}`;
-	}
+	if (fallbackSummary) notes.push(fallbackSummary);
+	if (notes.length > 0) result.notes = notes;
 	return result;
 }
 
@@ -1631,18 +1745,30 @@ function generateAgentId(): string {
 // Background agent registry — queryable by TUI / Telegram frontends
 // ---------------------------------------------------------------------------
 
+/**
+ * Lifecycle status of a background agent. `cancelled` means the user stopped it
+ * (a single-agent stop or a stop-all such as Esc / the parent stop control) —
+ * distinct from `failed`, which means the child itself errored.
+ */
+export type BackgroundAgentStatus = "running" | "completed" | "failed" | "cancelled";
+
 export interface BackgroundAgentInfo {
 	agentId: string;
 	agentType: string;
 	taskSummary: string;
 	startedAt: number;
-	status: "running" | "completed" | "failed";
+	status: BackgroundAgentStatus;
 	/** Directory containing the agent's session JSONL file (known at spawn time). */
 	sessionDir?: string;
 	/** Path to the agent's session JSONL file (discovered when the child exits). */
 	sessionFile?: string;
 	/** Working directory the agent runs in. */
 	cwd?: string;
+	/**
+	 * Parent session file the agent was launched from. A user stop records it in the
+	 * agent's cancellation marker so rehydration can match the marker to its parent.
+	 */
+	parentSessionFile?: string;
 	/** Safe host-generated pre-spawn routing decisions, ordered by chain step/attempt. */
 	arbitrations?: DispatchArbitrationRecord[];
 }
@@ -1663,6 +1789,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isExpectedFilesystemError(err: unknown): boolean {
 	return typeof (err as NodeJS.ErrnoException | undefined)?.code === "string";
+}
+
+/** Only absence is optional during primary-root restart recovery. */
+function isMissingFilesystemError(err: unknown): boolean {
+	return (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+function shouldSkipRehydrationFilesystemError(err: unknown, isPrimaryRoot: boolean, context: string): boolean {
+	if (isMissingFilesystemError(err)) return true;
+	if (isPrimaryRoot || !isExpectedFilesystemError(err)) return false;
+	log.warn(
+		`[subagent] skipped compatibility-root recovery (${context}): ${err instanceof Error ? err.message : String(err)}`,
+	);
+	return true;
 }
 
 function parseJsonlLine(line: string): Record<string, unknown> | undefined {
@@ -1699,7 +1839,7 @@ function readFirstNonEmptyLine(filePath: string): string | undefined {
 
 		return buffered.trim() ? buffered : undefined;
 	} catch (err) {
-		if (isExpectedFilesystemError(err)) return undefined;
+		if (isMissingFilesystemError(err)) return undefined;
 		throw err;
 	} finally {
 		if (fd !== undefined) {
@@ -1720,7 +1860,7 @@ function readFileSlice(filePath: string, start: number, length: number): string 
 		const bytesRead = readSync(fd, buffer, 0, length, start);
 		return buffer.toString("utf8", 0, bytesRead);
 	} catch (err) {
-		if (isExpectedFilesystemError(err)) return undefined;
+		if (isMissingFilesystemError(err)) return undefined;
 		throw err;
 	} finally {
 		if (fd !== undefined) {
@@ -1738,7 +1878,7 @@ function readFileStart(filePath: string, maxBytes: number): string | undefined {
 	try {
 		size = Math.min(statSync(filePath).size, maxBytes);
 	} catch (err) {
-		if (isExpectedFilesystemError(err)) return undefined;
+		if (isMissingFilesystemError(err)) return undefined;
 		throw err;
 	}
 	return readFileSlice(filePath, 0, size);
@@ -1752,7 +1892,7 @@ function readFileTail(filePath: string, maxBytes: number): string | undefined {
 		start = Math.max(0, size - maxBytes);
 		length = size - start;
 	} catch (err) {
-		if (isExpectedFilesystemError(err)) return undefined;
+		if (isMissingFilesystemError(err)) return undefined;
 		throw err;
 	}
 	return readFileSlice(filePath, start, length);
@@ -1767,6 +1907,18 @@ function parseSessionHeader(sessionFile: string): Record<string, unknown> | unde
 function comparablePath(pathValue: string): string {
 	const resolved = resolve(pathValue);
 	return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+/** Canonical identity for an existing path, with a lexical fallback for races/missing paths. */
+function canonicalExistingPath(pathValue: string): string {
+	let canonical: string;
+	try {
+		canonical = realpathSync.native(pathValue);
+	} catch (err) {
+		if (!isMissingFilesystemError(err)) throw err;
+		canonical = resolve(pathValue);
+	}
+	return process.platform === "win32" ? canonical.toLowerCase() : canonical;
 }
 
 function parentSessionMatches(recordedParentSession: string, parentSessionFile: string): boolean {
@@ -1814,7 +1966,12 @@ function findFirstUserMessageSummary(sessionFile: string): string | undefined {
 	return undefined;
 }
 
-function inferCompletedSessionStatus(sessionFile: string): "completed" | "failed" {
+/**
+ * Infer a finished child's status from the last assistant message in its session log.
+ * `aborted` only occurs when the parent gracefully cancelled the child (user stop), so it
+ * maps to `cancelled`; `error` maps to `failed`.
+ */
+function inferCompletedSessionStatus(sessionFile: string): Exclude<BackgroundAgentStatus, "running"> {
 	const tail = readFileTail(sessionFile, TAIL_READ_BYTES);
 	if (!tail) return "completed";
 
@@ -1826,9 +1983,102 @@ function inferCompletedSessionStatus(sessionFile: string): "completed" | "failed
 		if (entry.message.role !== "assistant") continue;
 
 		const stopReason = entry.message.stopReason;
-		return stopReason === "error" || stopReason === "aborted" ? "failed" : "completed";
+		if (stopReason === "aborted") return "cancelled";
+		return stopReason === "error" ? "failed" : "completed";
 	}
 	return "completed";
+}
+
+/**
+ * File in a background agent's session directory recording that the user stopped it.
+ * A stop doesn't always leave a trailing `aborted` message in the child's log: a chain
+ * stopped between steps, a child terminated after the grace period, and an agent stopped
+ * while queued or before spawn (which has no log at all). The marker is the authoritative
+ * record that rehydration checks first.
+ */
+export const SUBAGENT_CANCELLED_MARKER_FILE = "cancelled.json";
+
+interface SubagentCancellationMarker {
+	type: "subagent_cancelled";
+	version: 1;
+	cancelledAt: string;
+	/** Parent session file the agent was launched from (matched during rehydration). */
+	parentSession: string;
+	agentType: string;
+	taskSummary: string;
+	startedAt: string;
+	cwd?: string;
+}
+
+/**
+ * Record a user stop in the agent's session directory (created if the agent never
+ * spawned). Agents without a session directory or parent session file can't be
+ * rehydrated, so nothing is written for them. A write failure doesn't block the stop
+ * itself. It is logged as an error, because the agent may show as completed or be
+ * missing after a reload.
+ */
+function writeCancellationMarker(info: BackgroundAgentInfo): void {
+	if (!info.sessionDir || !info.parentSessionFile) return;
+	const marker: SubagentCancellationMarker = {
+		type: "subagent_cancelled",
+		version: 1,
+		cancelledAt: new Date().toISOString(),
+		parentSession: info.parentSessionFile,
+		agentType: info.agentType,
+		taskSummary: info.taskSummary,
+		startedAt: new Date(info.startedAt).toISOString(),
+		...(info.cwd ? { cwd: info.cwd } : {}),
+	};
+	try {
+		mkdirSync(info.sessionDir, { recursive: true });
+		writeFileSync(join(info.sessionDir, SUBAGENT_CANCELLED_MARKER_FILE), `${JSON.stringify(marker)}\n`);
+	} catch (err) {
+		log.error(
+			`[subagent] Failed to record the cancellation of background agent ${info.agentId} in ${info.sessionDir}: ${err instanceof Error ? err.message : String(err)}. After a reload it may show as completed or be missing.`,
+		);
+	}
+}
+
+function isCancellationMarker(value: unknown): value is SubagentCancellationMarker {
+	return (
+		isRecord(value) &&
+		value.type === "subagent_cancelled" &&
+		typeof value.parentSession === "string" &&
+		typeof value.agentType === "string" &&
+		value.agentType.trim() !== "" &&
+		typeof value.taskSummary === "string" &&
+		typeof value.startedAt === "string" &&
+		Number.isFinite(Date.parse(value.startedAt)) &&
+		(value.cwd === undefined || typeof value.cwd === "string")
+	);
+}
+
+/**
+ * Read an agent's cancellation marker. Returns `undefined` when there is none, the parsed
+ * marker when valid, and `"malformed"` (after a warning) when the file exists but can't be
+ * used. A malformed marker still proves the stop happened, but can't identify the parent.
+ * Filesystem errors other than absence propagate to the caller's recovery policy.
+ */
+function readCancellationMarker(sessionDir: string): SubagentCancellationMarker | "malformed" | undefined {
+	const markerPath = join(sessionDir, SUBAGENT_CANCELLED_MARKER_FILE);
+	let raw: string;
+	try {
+		raw = readFileSync(markerPath, "utf8");
+	} catch (err) {
+		if (isMissingFilesystemError(err)) return undefined;
+		throw err;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		parsed = undefined;
+	}
+	if (isCancellationMarker(parsed)) return parsed;
+	log.warn(
+		`[subagent] ignoring malformed cancellation marker ${markerPath}; the agent is still reported as cancelled`,
+	);
+	return "malformed";
 }
 
 function parseStartedAt(header: Record<string, unknown>, sessionFile: string): number {
@@ -1840,81 +2090,159 @@ function parseStartedAt(header: Record<string, unknown>, sessionFile: string): n
 	try {
 		return statSync(sessionFile).mtime.getTime();
 	} catch (err) {
-		if (isExpectedFilesystemError(err)) return Date.now();
+		if (isMissingFilesystemError(err)) return Date.now();
 		throw err;
 	}
 }
 
-function hasRegisteredSession(sessionDir: string, sessionFile: string): boolean {
-	const comparableSessionDir = comparablePath(sessionDir);
-	const comparableSessionFile = comparablePath(sessionFile);
+function hasRegisteredSession(sessionDir: string, sessionFile?: string): boolean {
+	const comparableSessionDir = canonicalExistingPath(sessionDir);
+	const comparableSessionFile = sessionFile ? canonicalExistingPath(sessionFile) : undefined;
 	for (const agent of backgroundAgentRegistry.values()) {
-		if (agent.sessionDir && comparablePath(agent.sessionDir) === comparableSessionDir) return true;
-		if (agent.sessionFile && comparablePath(agent.sessionFile) === comparableSessionFile) return true;
+		if (agent.sessionDir && canonicalExistingPath(agent.sessionDir) === comparableSessionDir) return true;
+		if (
+			comparableSessionFile &&
+			agent.sessionFile &&
+			canonicalExistingPath(agent.sessionFile) === comparableSessionFile
+		) {
+			return true;
+		}
 	}
 	return false;
 }
 
+/** A registry ID for a rehydrated agent, derived from its session directory name and kept unique. */
+function nextRehydratedAgentId(sessionDirName: string): string {
+	const baseAgentId = `${REHYDRATED_AGENT_ID_PREFIX}${sessionDirName}`;
+	let agentId = baseAgentId;
+	let suffix = 2;
+	while (backgroundAgentRegistry.has(agentId)) {
+		agentId = `${baseAgentId}-${suffix++}`;
+	}
+	return agentId;
+}
+
 /**
- * Best-effort recovery for completed background subagents after a dashboard/RPC
- * process resumes an existing parent session. Live background-agent state is an
- * in-memory registry, while child sessions are durable JSONL files under the
- * subagent sessions directory.
+ * Recover completed background subagents after a dashboard/RPC process resumes
+ * an existing parent session. Live background-agent state is an in-memory
+ * registry, while child sessions are durable JSONL files under the subagent
+ * sessions directory.
  *
- * Returns the number of newly registered agents. Expected filesystem and JSONL
- * parse failures are skipped; unexpected programming errors are allowed to throw.
+ * A user stop's cancellation marker ({@link SUBAGENT_CANCELLED_MARKER_FILE}) takes
+ * precedence over status inferred from the log. An agent stopped before it spawned has
+ * only the marker, and is recovered from it.
+ *
+ * The first root is authoritative: absence races and malformed JSON are skipped,
+ * while operational filesystem failures throw. Later roots are compatibility
+ * stores, so their operational filesystem failures are warned and skipped.
+ * Returns the number of newly registered agents.
  */
 export function rehydrateBackgroundAgentsFromDisk(
 	parentSessionFile: string | undefined,
-	subagentSessionsBase = getSubagentSessionsDir(),
+	subagentSessionRoots: string | readonly string[] = getSubagentSessionsDir(),
 ): number {
 	if (!parentSessionFile) return 0;
 
-	let entries: Dirent[];
-	try {
-		entries = readdirSync(subagentSessionsBase, { withFileTypes: true });
-	} catch (err) {
-		if (isExpectedFilesystemError(err)) return 0;
-		throw err;
-	}
-
+	const roots = typeof subagentSessionRoots === "string" ? [subagentSessionRoots] : subagentSessionRoots;
+	const scannedRoots = new Set<string>();
+	const seenSessionDirs = new Set<string>();
+	const seenSessionFiles = new Set<string>();
 	let registered = 0;
-	for (const entry of entries) {
-		if (!entry.isDirectory()) continue;
 
-		const sessionDir = join(subagentSessionsBase, entry.name);
-		const sessionFiles = discoverSessionFiles(sessionDir, entry.name);
-		if (sessionFiles.length === 0) continue;
-
-		let sessionFile: string | undefined;
-		let header: Record<string, unknown> | undefined;
-		for (const candidateFile of sessionFiles) {
-			const candidateHeader = parseSessionHeader(candidateFile);
-			if (candidateHeader?.type !== "session" || typeof candidateHeader.parentSession !== "string") continue;
-			if (!parentSessionMatches(candidateHeader.parentSession, parentSessionFile)) continue;
-			sessionFile = candidateFile;
-			header = candidateHeader;
-			break;
+	for (const [rootIndex, subagentSessionsBase] of roots.entries()) {
+		const isPrimaryRoot = rootIndex === 0;
+		let canonicalRoot: string;
+		try {
+			canonicalRoot = canonicalExistingPath(subagentSessionsBase);
+		} catch (err) {
+			if (shouldSkipRehydrationFilesystemError(err, isPrimaryRoot, `root ${subagentSessionsBase}`)) continue;
+			throw err;
 		}
-		if (!sessionFile || !header) continue;
+		if (scannedRoots.has(canonicalRoot)) continue;
+		scannedRoots.add(canonicalRoot);
 
-		const agentId = `${REHYDRATED_AGENT_ID_PREFIX}${entry.name}`;
-		if (backgroundAgentRegistry.has(agentId) || hasRegisteredSession(sessionDir, sessionFile)) continue;
+		let entries: Dirent[];
+		try {
+			entries = readdirSync(subagentSessionsBase, { withFileTypes: true });
+		} catch (err) {
+			if (shouldSkipRehydrationFilesystemError(err, isPrimaryRoot, `root ${subagentSessionsBase}`)) continue;
+			throw err;
+		}
 
-		const statusFile = sessionFiles[sessionFiles.length - 1] ?? sessionFile;
-		const agentType = typeof header.agentType === "string" && header.agentType.trim() ? header.agentType : "agent";
-		const taskSummary = findFirstUserMessageSummary(sessionFile) ?? `${agentType} (${entry.name})`;
-		backgroundAgentRegistry.set(agentId, {
-			agentId,
-			agentType,
-			taskSummary,
-			startedAt: parseStartedAt(header, sessionFile),
-			status: inferCompletedSessionStatus(statusFile),
-			sessionDir,
-			sessionFile,
-			cwd: typeof header.cwd === "string" ? header.cwd : undefined,
-		});
-		registered++;
+		for (const entry of entries) {
+			const sessionDir = join(subagentSessionsBase, entry.name);
+			try {
+				let isDirectory = entry.isDirectory();
+				if (!isDirectory && entry.isSymbolicLink()) {
+					isDirectory = statSync(sessionDir).isDirectory();
+				}
+				if (!isDirectory) continue;
+
+				const canonicalSessionDir = canonicalExistingPath(sessionDir);
+				if (seenSessionDirs.has(canonicalSessionDir)) continue;
+				seenSessionDirs.add(canonicalSessionDir);
+
+				const sessionFiles = discoverSessionFiles(sessionDir, entry.name, { throwOnOperationalError: true });
+				const cancellationMarker = readCancellationMarker(sessionDir);
+				if (sessionFiles.length === 0) {
+					// A user stop while the agent was queued or before it spawned leaves no log,
+					// only the cancellation marker.
+					if (cancellationMarker === undefined || cancellationMarker === "malformed") continue;
+					if (!parentSessionMatches(cancellationMarker.parentSession, parentSessionFile)) continue;
+					if (hasRegisteredSession(sessionDir)) continue;
+					const agentId = nextRehydratedAgentId(entry.name);
+					backgroundAgentRegistry.set(agentId, {
+						agentId,
+						agentType: cancellationMarker.agentType,
+						taskSummary: cancellationMarker.taskSummary,
+						startedAt: Date.parse(cancellationMarker.startedAt),
+						status: "cancelled",
+						sessionDir,
+						cwd: cancellationMarker.cwd,
+					});
+					registered++;
+					continue;
+				}
+
+				let sessionFile: string | undefined;
+				let header: Record<string, unknown> | undefined;
+				for (const candidateFile of sessionFiles) {
+					const candidateHeader = parseSessionHeader(candidateFile);
+					if (candidateHeader?.type !== "session" || typeof candidateHeader.parentSession !== "string") continue;
+					if (!parentSessionMatches(candidateHeader.parentSession, parentSessionFile)) continue;
+					const canonicalSessionFile = canonicalExistingPath(candidateFile);
+					if (seenSessionFiles.has(canonicalSessionFile)) break;
+					seenSessionFiles.add(canonicalSessionFile);
+					sessionFile = candidateFile;
+					header = candidateHeader;
+					break;
+				}
+				if (!sessionFile || !header || hasRegisteredSession(sessionDir, sessionFile)) continue;
+
+				const agentId = nextRehydratedAgentId(entry.name);
+
+				const statusFile = sessionFiles[sessionFiles.length - 1] ?? sessionFile;
+				const agentType =
+					typeof header.agentType === "string" && header.agentType.trim() ? header.agentType : "agent";
+				const taskSummary = findFirstUserMessageSummary(sessionFile) ?? `${agentType} (${entry.name})`;
+				backgroundAgentRegistry.set(agentId, {
+					agentId,
+					agentType,
+					taskSummary,
+					startedAt: parseStartedAt(header, sessionFile),
+					// The marker is authoritative: a stop between chain steps or a terminated child
+					// doesn't leave a trailing `aborted` message for inference to find.
+					status: cancellationMarker !== undefined ? "cancelled" : inferCompletedSessionStatus(statusFile),
+					sessionDir,
+					sessionFile,
+					cwd: typeof header.cwd === "string" ? header.cwd : undefined,
+				});
+				registered++;
+			} catch (err) {
+				if (shouldSkipRehydrationFilesystemError(err, isPrimaryRoot, `entry ${sessionDir}`)) continue;
+				throw err;
+			}
+		}
 	}
 
 	return registered;
@@ -1960,14 +2288,48 @@ export async function getBackgroundAgentPendingSteering(
 	return { steeringMode: state.steeringMode, pending };
 }
 
-/** Abort all running background agents. */
+/**
+ * Mark one registry entry cancelled, record the stop on disk, and abort its
+ * controller. The status is set before aborting so anything reacting
+ * synchronously to the abort (and the lifecycle, which skips status updates once
+ * its signal is aborted) observes `cancelled` rather than `running`. The
+ * controller's abort listeners perform the graceful child shutdown (RPC abort
+ * first, then SIGTERM/SIGKILL backstops).
+ */
+function cancelBackgroundAgentEntry(agentId: string, controller: AbortController): void {
+	const entry = backgroundAgentRegistry.get(agentId);
+	if (entry && entry.status === "running") {
+		entry.status = "cancelled";
+		writeCancellationMarker(entry);
+	}
+	backgroundAbortControllers.delete(agentId);
+	backgroundControlClients.delete(agentId);
+	controller.abort();
+}
+
+/**
+ * Cancel exactly one running background agent (user stop). Siblings, the parent
+ * session, and their control channels are untouched. Works for agents that are
+ * executing, queued for a concurrency slot, or between chain steps; a chain is
+ * stopped as a whole. Completion is reported asynchronously through the normal
+ * background-complete path with `cancelled = true`.
+ *
+ * Throws for unknown agents and agents that are no longer running (completed,
+ * failed, cancelled, or rehydrated from disk) — never a silent no-op.
+ */
+export function abortBackgroundAgent(agentId: string): void {
+	const info = backgroundAgentRegistry.get(agentId);
+	if (!info) throw new Error(`Unknown background agent "${agentId}".`);
+	if (info.status !== "running") throw new Error(`Background agent "${agentId}" is no longer running.`);
+	const controller = backgroundAbortControllers.get(agentId);
+	if (!controller) throw new Error(`Background agent "${agentId}" has no abort controller; it cannot be stopped.`);
+	cancelBackgroundAgentEntry(agentId, controller);
+}
+
+/** Cancel all running background agents (Esc / parent stop). */
 export function abortBackgroundAgents(): void {
-	for (const [id, controller] of backgroundAbortControllers) {
-		controller.abort();
-		const entry = backgroundAgentRegistry.get(id);
-		if (entry && entry.status === "running") {
-			entry.status = "failed";
-		}
+	for (const [id, controller] of [...backgroundAbortControllers]) {
+		cancelBackgroundAgentEntry(id, controller);
 	}
 	backgroundAbortControllers.clear();
 	backgroundControlClients.clear();
@@ -1986,6 +2348,8 @@ export function pruneBackgroundAgents(maxAgeMs = 5 * 60 * 1000): void {
 }
 
 export interface SubagentToolOptions {
+	/** Resolved root for new subagent child-session directories. Defaults to the legacy agent root. */
+	subagentSessionsDir?: string;
 	/** Called when a background subagent starts. Used by TUI to show status indicators. */
 	onBackgroundStart?: (agentId: string, agentType: string, taskSummary: string, sessionDir?: string) => void;
 	/** Called when a background subagent completes with its result. `cancelled` is true if the user aborted it. */
@@ -2204,7 +2568,23 @@ function formatSubagentResult(
 	return text;
 }
 
-export function formatSingleResult(result: SubagentResult): string {
+/**
+ * Wrap a subagent's own output in labelled delimiter lines so it can't be mistaken for
+ * the system lines around it (execution metadata, cancellation/error notes, session log,
+ * still-running list). `partial` marks output from a run that did not finish cleanly
+ * (cancelled, failed, or truncated). Blank lines around the delimiters keep them as
+ * separate paragraphs when the text is rendered as Markdown (dashboard, Telegram).
+ */
+export function formatAgentOutputBlock(output: string, partial: boolean): string {
+	return `--- agent output${partial ? " (partial)" : ""} ---\n\n${output}\n\n--- end of agent output ---`;
+}
+
+/**
+ * Render one subagent result (used for each chain step). The agent's output is wrapped by
+ * `formatAgentOutputBlock`; `cancelled` marks a step that was stopped by the user, whose
+ * output is therefore partial.
+ */
+export function formatSingleResult(result: SubagentResult, cancelled = false): string {
 	const metadata = [
 		result.model ? `model: ${result.model}` : undefined,
 		result.thinking ? `thinking: ${result.thinking}` : undefined,
@@ -2221,8 +2601,12 @@ export function formatSingleResult(result: SubagentResult): string {
 		// Clean exit but an error was surfaced (e.g. truncation at the token limit).
 		text += `**Error**: ${result.errorMessage}\n`;
 	}
+	if (result.notes && result.notes.length > 0) {
+		text += `\n${result.notes.join("\n\n")}\n`;
+	}
 	if (result.output) {
-		text += `\n${result.output}`;
+		const partial = cancelled || result.exitCode !== 0 || !!result.errorMessage;
+		text += `\n${formatAgentOutputBlock(result.output, partial)}`;
 	} else if (result.exitCode === 0 && !result.errorMessage) {
 		text += "\n(No output)";
 	}
@@ -2236,6 +2620,7 @@ export function createSubagentToolDefinition(
 	cwd: string,
 	options?: SubagentToolOptions,
 ): ToolDefinition<typeof subagentSchema, SubagentToolDetails | undefined> {
+	const subagentSessionsBase = options?.subagentSessionsDir ?? getSubagentSessionsDir();
 	const onBackgroundStart = options?.onBackgroundStart;
 	const onBackgroundComplete = options?.onBackgroundComplete;
 	const onBackgroundEvent = options?.onBackgroundEvent;
@@ -2260,7 +2645,7 @@ export function createSubagentToolDefinition(
 	// supplied (external SDK callers, tests) the tool owns a fresh per-instance gate, which
 	// still keeps separately embedded sessions from coupling through module-global state.
 	const concurrencyGate = options?.concurrencyGate ?? createSubagentConcurrencyGate(maxConcurrentSubagents);
-	const acquireBackgroundSlot = (): Promise<void> => concurrencyGate.acquire();
+	const acquireBackgroundSlot = (signal: AbortSignal): Promise<void> => concurrencyGate.acquire(signal);
 	const releaseBackgroundSlot = (): void => concurrencyGate.release();
 
 	// Discover agents at definition time to build the prompt guidelines.
@@ -2374,6 +2759,7 @@ export function createSubagentToolDefinition(
 						status: "running",
 						sessionDir,
 						cwd: agentCwd,
+						parentSessionFile: getParentSessionFile(),
 					});
 					backgroundAbortControllers.set(agentId, bgAbort);
 					onBackgroundStart?.(agentId, agentName, taskSummary, sessionDir);
@@ -2419,8 +2805,12 @@ export function createSubagentToolDefinition(
 					};
 
 					const run = async () => {
-						await acquireBackgroundSlot();
+						// A stop while queued for a slot settles immediately (the gate rejects
+						// without taking a slot), so only release a slot this run acquired.
+						let slotAcquired = false;
 						try {
+							await acquireBackgroundSlot(bgSignal);
+							slotAcquired = true;
 							const result = await runFn(bgSignal, onChildEvent, onArbitrationRecord, onControlAvailable);
 							const entry = backgroundAgentRegistry.get(agentId);
 							if (entry && !bgSignal.aborted) entry.status = result.exitCode === 0 ? "completed" : "failed";
@@ -2441,7 +2831,7 @@ export function createSubagentToolDefinition(
 							});
 						} finally {
 							backgroundControlClients.delete(agentId);
-							releaseBackgroundSlot();
+							if (slotAcquired) releaseBackgroundSlot();
 						}
 					};
 					run().catch((err) => {
@@ -2475,7 +2865,6 @@ export function createSubagentToolDefinition(
 				};
 
 				// Helper to launch a single background task
-				const subagentSessionsBase = getSubagentSessionsDir();
 				const launchBackgroundTask = (
 					agentName: string,
 					task: string,
@@ -2635,8 +3024,14 @@ export function createSubagentToolDefinition(
 								getParentSessionId(),
 								getSingleModelMode,
 							);
+							// A user stop ends the chain at its current (last) step, so only that step's
+							// output can be cut short.
+							const stoppedAtLastStep = signal.aborted;
 							const resultText = results
-								.map((r, i) => `### Step ${i + 1}\n${formatSingleResult(r)}`)
+								.map(
+									(r, i) =>
+										`### Step ${i + 1}\n${formatSingleResult(r, stoppedAtLastStep && i === results.length - 1)}`,
+								)
 								.join("\n\n---\n\n");
 							const failed = results.filter((r) => r.exitCode !== 0);
 							// Per-step session logs are already embedded in resultText via formatSingleResult

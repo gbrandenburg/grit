@@ -379,6 +379,25 @@ describe("pairing expiry auth status", () => {
 });
 
 describe("app store SSE sync", () => {
+	it("connects with live runtimes before omitted disk inventory finishes loading", async () => {
+		const live = runtimeSnapshot("live-first", false);
+		const inventory = deferred<{ sessions: [] }>();
+		vi.mocked(api.fleet).mockResolvedValueOnce({
+			runtimes: [live],
+			diskSessions: [],
+			diskSessionsComplete: false,
+		});
+		vi.mocked(api.sessions).mockReturnValueOnce(inventory.promise);
+
+		const store = await makeStartedStore();
+
+		expect(store.fleet().runtimes).toEqual([live]);
+		expect(connectEvents).toHaveBeenCalledOnce();
+		expect(api.sessions).toHaveBeenCalledOnce();
+		inventory.resolve({ sessions: [] });
+		await flushAsyncWork();
+	});
+
 	it("creates per-key session state lazily and routes events", async () => {
 		const store = await makeStartedStore();
 
@@ -2331,7 +2350,7 @@ describe("fleet snapshot and inventory store foundation", () => {
 		return runtime;
 	}
 
-	function stats(totalMessages: number, tokensTotal: number, cost: number) {
+	function stats(totalMessages: number, tokensTotal: number, cost: number, subagentCost?: number) {
 		return {
 			sessionId: "s",
 			userMessages: 1,
@@ -2341,6 +2360,7 @@ describe("fleet snapshot and inventory store foundation", () => {
 			totalMessages,
 			tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: tokensTotal },
 			cost,
+			subagentCost,
 			contextUsage: { tokens: tokensTotal, contextWindow: 100_000, percent: 10 },
 		};
 	}
@@ -2435,6 +2455,109 @@ describe("fleet snapshot and inventory store foundation", () => {
 		await flushAsyncWork();
 
 		expect(api.sessions).not.toHaveBeenCalled();
+	});
+
+	describe("live session files written after the last inventory read", () => {
+		const file = "/sessions/new.jsonl";
+		function liveFile(messageCount: number, streaming = false): RuntimeInfoDto {
+			const runtime = fleetSnapshot("new", messageCount);
+			runtime.state.sessionFile = file;
+			runtime.state.isStreaming = streaming;
+			return runtime;
+		}
+		const saved = {
+			path: file,
+			id: "new",
+			cwd: "/tmp/project",
+			created: "2026-01-02T00:00:00.000Z",
+			modified: "2026-01-02T00:01:00.000Z",
+			messageCount: 2,
+			firstMessage: "hi",
+		};
+
+		it("re-reads inventory once the turn that wrote a new session file ends, then never again", async () => {
+			vi.mocked(api.fleet).mockResolvedValueOnce({ runtimes: [liveFile(0)], diskSessions: [] });
+			const store = await makeStartedStore();
+			vi.mocked(api.sessions).mockClear();
+
+			// Mid-turn the file may not exist yet: no scan.
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(1, true)] });
+			await flushAsyncWork();
+			expect(api.sessions).not.toHaveBeenCalled();
+
+			// The first assistant reply persisted the file and the turn ended.
+			vi.mocked(api.sessions).mockResolvedValueOnce({ sessions: [saved] });
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(2)] });
+			await flushAsyncWork();
+			expect(api.sessions).toHaveBeenCalledTimes(1);
+			expect(store.fleet().diskSessions.map((session) => session.path)).toEqual([file]);
+
+			// Indexed now: repeated idle snapshots and later turns do not scan again.
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(2)] });
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(4)] });
+			await flushAsyncWork();
+			expect(api.sessions).toHaveBeenCalledTimes(1);
+			expect(api.fleet).toHaveBeenCalledTimes(1);
+		});
+
+		it("re-reads a still-missing file only after newer messages, not on every idle snapshot", async () => {
+			vi.mocked(api.fleet).mockResolvedValueOnce({ runtimes: [liveFile(0)], diskSessions: [] });
+			await makeStartedStore();
+			vi.mocked(api.sessions).mockClear();
+			vi.mocked(api.sessions).mockResolvedValue({ sessions: [] }); // e.g. aborted before any reply
+
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(1)] });
+			await flushAsyncWork();
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(1)] });
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(1)] });
+			await flushAsyncWork();
+			expect(api.sessions).toHaveBeenCalledTimes(1);
+
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(3)] });
+			await flushAsyncWork();
+			expect(api.sessions).toHaveBeenCalledTimes(2);
+		});
+
+		it("does not stack a re-read on top of a pending one", async () => {
+			vi.mocked(api.fleet).mockResolvedValueOnce({ runtimes: [liveFile(0)], diskSessions: [] });
+			const store = await makeStartedStore();
+			vi.mocked(api.sessions).mockClear();
+			const pending = deferred<{ sessions: (typeof saved)[] }>();
+			vi.mocked(api.sessions).mockReturnValueOnce(pending.promise);
+
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(2)] });
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(2)] });
+			await flushAsyncWork();
+			expect(api.sessions).toHaveBeenCalledTimes(1);
+
+			pending.resolve({ sessions: [saved] });
+			await flushAsyncWork();
+			expect(store.fleet().diskSessions.map((session) => session.path)).toEqual([file]);
+		});
+
+		it("waits for the first inventory read before re-reading for missing live files", async () => {
+			const initial = deferred<{ sessions: (typeof saved)[] }>();
+			vi.mocked(api.fleet).mockResolvedValueOnce({
+				runtimes: [liveFile(0)],
+				diskSessions: [],
+				diskSessionsComplete: false,
+			});
+			vi.mocked(api.sessions).mockReturnValueOnce(initial.promise);
+			await makeStartedStore();
+			expect(api.sessions).toHaveBeenCalledTimes(1); // live-first startup inventory
+
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(2)] });
+			await flushAsyncWork();
+			expect(api.sessions).toHaveBeenCalledTimes(1);
+
+			// That startup read began before these messages, so it cannot vouch for the file.
+			vi.mocked(api.sessions).mockResolvedValueOnce({ sessions: [saved] });
+			initial.resolve({ sessions: [] });
+			await flushAsyncWork();
+			emit("", { type: "fleet_snapshot", runtimes: [liveFile(2)] });
+			await flushAsyncWork();
+			expect(api.sessions).toHaveBeenCalledTimes(2);
+		});
 	});
 
 	it("surfaces membership inventory failures without discarding the previous disk rows", async () => {
@@ -2710,7 +2833,7 @@ describe("fleet snapshot and inventory store foundation", () => {
 		});
 		const store = await makeStartedStore();
 		vi.mocked(api.stats)
-			.mockResolvedValueOnce(stats(5, 50, 0.5))
+			.mockResolvedValueOnce(stats(5, 50, 0.5, 0.25))
 			.mockRejectedValueOnce(new Error("b stats unavailable"));
 
 		await store.refreshFleetStats();
@@ -2718,7 +2841,7 @@ describe("fleet snapshot and inventory store foundation", () => {
 		expect(api.stats).toHaveBeenCalledWith("a", expect.any(AbortSignal));
 		expect(api.stats).toHaveBeenCalledWith("b", expect.any(AbortSignal));
 		expect(store.fleet().runtimes[0]).toMatchObject({
-			stats: { tokensTotal: 50, cost: 0.5 },
+			stats: { tokensTotal: 50, cost: 0.5, subagentCost: 0.25 },
 			state: { messageCount: 5, contextUsage: { tokens: 50 } },
 		});
 		expect(store.fleet().runtimes[1]).not.toHaveProperty("stats");

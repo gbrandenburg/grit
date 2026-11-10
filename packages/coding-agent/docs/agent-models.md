@@ -40,7 +40,7 @@ If the `agentModels.models` list is empty or undefined for a given agent, resolu
 
 The `singleModelMode` setting (top-level, default `false`) is a global kill-switch for model selection: when enabled, every subagent runs on the **parent session's model** and the resolution order above is skipped entirely. Per-invocation `model` overrides, `agentModels.models` fallback lists, agent-definition `model` fields, spawn-time availability probes, and the optional [Dispatch Arbiter](#dispatch-arbiter) are all bypassed; the child process is spawned directly on the parent's resolved model.
 
-Any requested model selection — including one identical to the parent's model — is reported to the parent model by prepending this notice to the child's output:
+Any requested model selection — including one identical to the parent's model — is reported to the parent model by placing this notice just before the child's output (outside its `--- agent output ---` block):
 
 ```
 [WARNING: The user has enabled "single model mode" in the settings, so the model selection for this subagent was ignored. Using parent model "<provider>/<model>".]
@@ -54,7 +54,7 @@ Configure it in `settings.json` (global file, with the standard project-level ov
 
 The `subagent` tool accepts an optional `thinking` value in single mode, at the top level for parallel/chain inheritance, or on an individual task/step. Per-task values win over the top-level value.
 
-Supported values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Validation happens after the child model resolves: non-`off` levels fail for non-reasoning models, `xhigh` requires advertised xhigh support, and `max` requires a max-capable model (currently the GPT-5.6 family including Sol, Terra, and Luna, and the GPT-6 family including Astra). `max` does not replace `xhigh`. Codex `ultra` additionally enables client-side multi-agent orchestration, so it is not accepted or sent as a raw effort. Omit the field to preserve the child's normal default/settings behavior. The child's actual effective level is reported in its `agent_start` event, result metadata, and `background_agent_end` event.
+Supported values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Validation happens after the child model resolves: non-`off` levels fail for non-reasoning models, `off` fails for models whose thinking cannot be turned off (Claude Opus 5.5 — use `minimal` or `low`), `xhigh` requires advertised xhigh support, and `max` requires a max-capable model (currently the GPT-5.6 family including Sol, Terra, and Luna, the GPT-6 family including Astra, and Claude Opus/Sonnet 4.6+ and Haiku 5.5 on Anthropic, GitHub Copilot, and Bedrock). `max` does not replace `xhigh`. Codex `ultra` additionally enables client-side multi-agent orchestration, so it is not accepted or sent as a raw effort. Omit the field to preserve the child's normal default/settings behavior. The child's actual effective level is reported in its `agent_start` event, result metadata, and `background_agent_end` event.
 
 ## Evidence-based Routing Guide
 

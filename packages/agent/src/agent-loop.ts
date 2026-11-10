@@ -6,10 +6,9 @@
 import {
 	type AssistantMessage,
 	type Context,
+	clampThinkingLevel,
 	EventStream,
 	streamSimple,
-	supportsMax,
-	supportsXhigh,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@dreb/ai";
@@ -28,10 +27,7 @@ import type {
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 function getEffectiveThinkingLevel(config: AgentLoopConfig): ThinkingLevel {
-	const requested = config.reasoning ?? "off";
-	if (!config.model.reasoning) return "off";
-	if (requested === "max" && !supportsMax(config.model)) return supportsXhigh(config.model) ? "xhigh" : "high";
-	return requested === "xhigh" && !supportsXhigh(config.model) ? "high" : requested;
+	return clampThinkingLevel(config.model, config.reasoning ?? "off");
 }
 
 /**
@@ -507,8 +503,10 @@ async function streamAssistantResponse(
 					case "done":
 					case "error": {
 						const result = await response.result();
-						// Check if this is a stream-drop error that should be retried
-						const isDrop = result.stopReason === "error" && isStreamDropError(result.errorMessage);
+						// Check if this is a stream-drop error that should be retried.
+						// A safety refusal is never a drop, whatever its provider-supplied text says.
+						const isDrop =
+							result.stopReason === "error" && !result.refusal && isStreamDropError(result.errorMessage);
 						if (isDrop && streamDropAttempt < maxRetries && !signal?.aborted) {
 							shouldRetry = true;
 							retryError =

@@ -479,9 +479,12 @@ describe("skills", () => {
 			expect(body).toContain("no special runtime support is required");
 			expect(body).toContain("stop with an actionable error before researching or writing a guide");
 			expect(body).toContain("unbounded all-model research");
-			expect(body).toContain("directory does not exist or contains no session JSONL files");
+			expect(body).toContain("all discovery roots are absent or contain no session JSONL files");
+			expect(body).toContain("Read `subagentSessionDir` only from the global");
+			expect(body).toContain("Use that configured write root first and the legacy root second");
+			expect(body).toContain("Do not move, copy, delete, or rewrite session files");
 			expect(body).toContain("cold-start mode");
-			expect(body).toContain("every snapshotted file is required evidence");
+			expect(body).toContain("every deduplicated snapshotted file is required evidence");
 			expect(body).toContain("every non-empty JSONL line parses");
 			expect(body).toContain("stop loudly and identify the affected file");
 			expect(body).toContain("do not silently skip it and do not call the run cold-start");
@@ -558,6 +561,18 @@ describe("skills", () => {
 			expect(body).toContain("Free text, a skipped or unanswered question, cancellation");
 			expect(body).toContain("title, body, target repository, or proposed labels invalidates prior approval");
 			expect(body).toContain('gh issue create --repo "<owner/repo>"');
+		});
+
+		it("mach6-issue ASSESS mode guards against rejected scope from linked issues", () => {
+			const body = readBuiltInSkill("mach6-issue");
+			expect(body).toContain("sole source of requirements");
+			expect(body).toContain("context only");
+			expect(body).toContain("presumed excluded");
+			expect(body).toContain("adopted / rejected / split / superseded / unknown");
+			expect(body).toContain("quote the rejection or split discussion");
+			expect(body).toContain("**Explicitly out of scope (prior rejections)**");
+			expect(body).toContain('"none found" explicitly');
+			expect(body).toContain("never be merged into requirements, scope, or risks");
 		});
 
 		it("mach6 CI workflows use watch_github_ci instead of polling or wait", () => {

@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage, ThinkingLevel } from "@dreb/agent-core";
-import type { ImageContent, Model, Transport } from "@dreb/ai";
+import type { AssistantMessageEvent, ImageContent, Model, Transport } from "@dreb/ai";
 import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -84,6 +84,8 @@ export type RpcCommand =
 	| { id?: string; type: "import_jsonl"; inputPath: string }
 	| { id?: string; type: "switch_session"; sessionPath: string }
 	| { id?: string; type: "delete_session"; sessionPath: string }
+	/** Generate a title for a saved session file (read-only) with the tab-title generator. */
+	| { id?: string; type: "generate_session_title"; sessionPath: string }
 	| { id?: string; type: "fork"; entryId: string }
 	| { id?: string; type: "get_fork_messages" }
 	| { id?: string; type: "get_tree" }
@@ -97,7 +99,11 @@ export type RpcCommand =
 			label?: string;
 	  }
 	| { id?: string; type: "get_last_assistant_text" }
-	| { id?: string; type: "set_session_name"; name: string }
+	/**
+	 * Rename the current session. With `sessionPath`, the rename applies only while that file is
+	 * this runtime's current session; otherwise it fails without changing anything.
+	 */
+	| { id?: string; type: "set_session_name"; name: string; sessionPath?: string }
 
 	// Messages
 	| { id?: string; type: "get_messages" }
@@ -113,6 +119,7 @@ export type RpcCommand =
 	| { id?: string; type: "list_background_agents" }
 	| { id?: string; type: "steer_background_agent"; agentId: string; message: string }
 	| { id?: string; type: "get_background_agent_pending"; agentId: string }
+	| { id?: string; type: "abort_background_agent"; agentId: string }
 	| { id?: string; type: "list_agent_types" }
 
 	// Settings (persistent defaults)
@@ -228,8 +235,35 @@ export interface RpcDashboardSnapshotBarrierEvent {
 	snapshotId: string;
 }
 
+/**
+ * `assistantMessageEvent` as it appears on the RPC wire. RPC projects the
+ * cumulative `partial` snapshot away by default (issue 535); it is present only
+ * when the server runs with `--rpc-full-message-updates`. Deltas, `message`
+ * (on `done`), and `error` (on `error`) are unchanged.
+ */
+export type RpcAssistantMessageEvent = AssistantMessageEvent extends infer E
+	? E extends { partial: infer P }
+		? Omit<E, "partial"> & { partial?: P }
+		: E
+	: never;
+
+/**
+ * `message_update` as it appears on the RPC wire. By default RPC strips the
+ * cumulative `message` and `assistantMessageEvent.partial`; both are present
+ * only with `--rpc-full-message-updates`. Reconstruct streamed content from the
+ * deltas and use `message_end` for the authoritative final message.
+ */
+export interface RpcMessageUpdateEvent {
+	type: "message_update";
+	message?: AgentMessage;
+	assistantMessageEvent: RpcAssistantMessageEvent;
+}
+
+/** A session event as serialized on the RPC wire (message_update projected). */
+export type RpcSessionEvent = Exclude<AgentSessionEvent, { type: "message_update" }> | RpcMessageUpdateEvent;
+
 /** Non-response JSONL messages emitted by the RPC server on stdout. */
-export type RpcEvent = AgentSessionEvent | RpcExtensionUIRequest | RpcDashboardSnapshotBarrierEvent;
+export type RpcEvent = RpcSessionEvent | RpcExtensionUIRequest | RpcDashboardSnapshotBarrierEvent;
 
 export interface RpcSessionState {
 	model?: Model<any>;
@@ -286,7 +320,13 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "get_dashboard_snapshot"; success: true; data: RpcDashboardSnapshot }
 	| { id?: string; type: "response"; command: "get_resources"; success: true; data: RpcResources }
 	| { id?: string; type: "response"; command: "get_git_branch"; success: true; data: { branch: string | null } }
-	| { id?: string; type: "response"; command: "get_daily_cost"; success: true; data: { cost: number } }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_daily_cost";
+			success: true;
+			data: { cost: number; main: number; subagent: number };
+	  }
 
 	// Model
 	| {
@@ -376,6 +416,7 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "import_jsonl"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "switch_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "delete_session"; success: true; data: { method: "trash" | "unlink" } }
+	| { id?: string; type: "response"; command: "generate_session_title"; success: true; data: { title: string } }
 	| { id?: string; type: "response"; command: "fork"; success: true; data: { text: string; cancelled: boolean } }
 	| {
 			id?: string;
@@ -444,6 +485,7 @@ export type RpcResponse =
 			data: { agents: RpcBackgroundAgentInfo[] };
 	  }
 	| { id?: string; type: "response"; command: "steer_background_agent"; success: true }
+	| { id?: string; type: "response"; command: "abort_background_agent"; success: true }
 	| {
 			id?: string;
 			type: "response";
@@ -531,8 +573,8 @@ export interface RpcBackgroundAgentInfo {
 	taskSummary: string;
 	/** ISO timestamp of launch */
 	startedAt: string;
-	/** Lifecycle status */
-	status: "running" | "completed" | "failed";
+	/** Lifecycle status (`cancelled` = stopped by the user) */
+	status: "running" | "completed" | "failed" | "cancelled";
 	/** Directory containing the agent's session JSONL file (known at spawn time) */
 	sessionDir?: string;
 	/** Path to the agent's session JSONL file (available after the child exits) */

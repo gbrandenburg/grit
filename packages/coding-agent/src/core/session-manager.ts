@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import type { Stats } from "node:fs";
 import { readdir, readFile, stat, unlink } from "node:fs/promises";
 import type { AgentMessage } from "@dreb/agent-core";
 import type { ImageContent, Message, TextContent } from "@dreb/ai";
@@ -7,6 +8,7 @@ import {
 	appendFileSync,
 	closeSync,
 	existsSync,
+	fstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -15,7 +17,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { join, resolve } from "path";
+import { dirname, join, resolve, sep } from "path";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import {
 	type BashExecutionMessage,
@@ -183,10 +185,14 @@ export interface SessionInfo {
 	allMessagesText: string;
 }
 
+/** Session-list metadata without the full transcript search text. */
+export type SessionMetadata = Omit<SessionInfo, "allMessagesText">;
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
 	| "getSessionDir"
+	| "getCustomSessionInventoryRoot"
 	| "getSessionId"
 	| "getSessionFile"
 	| "getLeafId"
@@ -460,20 +466,180 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	return entries;
 }
 
+/** Upper bound on bytes scanned for a session header line (headers carry paths, so 512 bytes is not enough). */
+const MAX_SESSION_HEADER_BYTES = 64 * 1024;
+
+/**
+ * Read a file's first line without loading the whole file. Returns undefined when the line
+ * exceeds `maxBytes`. Filesystem errors propagate.
+ */
+function readFirstLine(filePath: string, maxBytes: number): string | undefined {
+	const fd = openSync(filePath, "r");
+	try {
+		const chunks: Buffer[] = [];
+		const buffer = Buffer.alloc(4096);
+		let position = 0;
+		while (position < maxBytes) {
+			const bytesRead = readSync(fd, buffer, 0, Math.min(buffer.length, maxBytes - position), position);
+			if (bytesRead === 0) return Buffer.concat(chunks).toString("utf8");
+			const newline = buffer.subarray(0, bytesRead).indexOf(0x0a);
+			if (newline !== -1) {
+				chunks.push(Buffer.from(buffer.subarray(0, newline)));
+				return Buffer.concat(chunks).toString("utf8");
+			}
+			chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
+			position += bytesRead;
+		}
+		return undefined;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/**
+ * Whether `filePath` is a non-empty file whose last byte is not a newline. dreb ends every record
+ * with "\n", but a session file edited by hand or written by another JSONL tool may leave its last
+ * record unterminated, and an interrupted write leaves a partial line. Appending a record there
+ * without first starting a new line would join it to that line and make both unreadable.
+ */
+function endsWithoutNewline(filePath: string): boolean {
+	let fd: number;
+	try {
+		fd = openSync(filePath, "r");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+	try {
+		const { size } = fstatSync(fd);
+		if (size === 0) return false;
+		const last = Buffer.alloc(1);
+		readSync(fd, last, 0, 1, size - 1);
+		return last[0] !== 0x0a;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function parseSessionHeaderLine(line: string | undefined): SessionHeader | undefined {
+	if (!line) return undefined;
+	try {
+		const header = JSON.parse(line);
+		return header?.type === "session" && typeof header.id === "string" ? (header as SessionHeader) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function isValidSessionFile(filePath: string): boolean {
 	try {
-		const fd = openSync(filePath, "r");
-		const buffer = Buffer.alloc(512);
-		const bytesRead = readSync(fd, buffer, 0, 512, 0);
-		closeSync(fd);
-		const firstLine = buffer.toString("utf8", 0, bytesRead).split("\n")[0];
-		if (!firstLine) return false;
-		const header = JSON.parse(firstLine);
-		return header.type === "session" && typeof header.id === "string";
+		return parseSessionHeaderLine(readFirstLine(filePath, MAX_SESSION_HEADER_BYTES)) !== undefined;
 	} catch {
-		/* Not a valid session file (corrupt, not JSON) */
+		/* Not a valid session file (unreadable) */
 		return false;
 	}
+}
+
+/** Result of {@link checkSessionFile}: the resolved path and header, or why it is not a usable session file. */
+export type SessionFileCheck = { ok: true; path: string; header: SessionHeader } | { ok: false; error: string };
+
+/**
+ * Check, without side effects, that a caller-supplied path names an existing session file:
+ * a `.jsonl` regular file whose first line is a valid session header.
+ *
+ * {@link SessionManager.open} is not safe on unchecked paths: it truncates an existing file that
+ * lacks a session header and creates missing parent directories. Callers that open or read a
+ * session by an externally supplied path (e.g. the dashboard) must check it first. Like
+ * `switch_session` and {@link SessionManager.deleteSession}, there is no sessions-directory
+ * containment guard (see the PR #315 discussion).
+ */
+export function checkSessionFile(sessionPath: string): SessionFileCheck {
+	const resolvedPath = resolve(sessionPath);
+	if (!resolvedPath.endsWith(".jsonl")) {
+		return { ok: false, error: `Not a session file (expected .jsonl): ${sessionPath}` };
+	}
+
+	let stats: Stats;
+	try {
+		stats = statSync(resolvedPath);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException | undefined)?.code;
+		if (code === "ENOENT" || code === "ENOTDIR") {
+			return { ok: false, error: `Session file does not exist: ${sessionPath}` };
+		}
+		return { ok: false, error: `Cannot access session file ${sessionPath}: ${(error as Error).message}` };
+	}
+	if (!stats.isFile()) {
+		return { ok: false, error: `Not a session file (not a regular file): ${sessionPath}` };
+	}
+
+	let firstLine: string | undefined;
+	try {
+		firstLine = readFirstLine(resolvedPath, MAX_SESSION_HEADER_BYTES);
+	} catch (error) {
+		return { ok: false, error: `Cannot read session file ${sessionPath}: ${(error as Error).message}` };
+	}
+	const header = parseSessionHeaderLine(firstLine);
+	if (!header) {
+		return { ok: false, error: `Not a session file (missing or invalid session header): ${sessionPath}` };
+	}
+	return { ok: true, path: resolvedPath, header };
+}
+
+/** A persisted session's header and current-branch messages, read without modifying the file. */
+export interface SessionTranscript {
+	header: SessionHeader;
+	/**
+	 * Messages on the current branch from root to leaf. Compaction is ignored, so messages a
+	 * compaction summarized (including the session's original first request) are present.
+	 */
+	messages: AgentMessage[];
+}
+
+/**
+ * Read a persisted session's transcript for analysis (e.g. on-demand titling).
+ *
+ * Unlike {@link SessionManager.open}, this never writes: old-format sessions are migrated in
+ * memory only, and invalid paths are rejected by {@link checkSessionFile} before anything is read.
+ * The current branch ends at the last entry in the file, matching what a resume would load.
+ * Throws an Error describing why the path is not a readable session file.
+ */
+export function readSessionTranscript(sessionPath: string): SessionTranscript {
+	const check = checkSessionFile(sessionPath);
+	if (!check.ok) throw new Error(check.error);
+
+	const entries = loadEntriesFromFile(check.path);
+	const header = entries[0];
+	if (!header || header.type !== "session") {
+		throw new Error(`Not a session file (missing or invalid session header): ${sessionPath}`);
+	}
+	migrateToCurrentVersion(entries);
+
+	const sessionEntries = entries.filter((entry): entry is SessionEntry => entry.type !== "session");
+	const byId = new Map(sessionEntries.map((entry) => [entry.id, entry]));
+	const branch: SessionEntry[] = [];
+	const visited = new Set<string>();
+	let current = sessionEntries.at(-1);
+	// The visited guard keeps a corrupt parentId cycle from looping forever.
+	while (current && !visited.has(current.id)) {
+		visited.add(current.id);
+		branch.push(current);
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+	branch.reverse();
+
+	const messages = branch.flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+	return { header: header as SessionHeader, messages };
+}
+
+/** The session name recorded in a session file: the latest `session_info` entry, if any. */
+function readPersistedSessionName(filePath: string): string | undefined {
+	const entries = loadEntriesFromFile(filePath);
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type === "session_info") return entry.name?.trim() || undefined;
+	}
+	return undefined;
 }
 
 /** Exported for testing */
@@ -568,73 +734,151 @@ function resolveForDeletion(filePath: string): string {
 	return resolve(filePath);
 }
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+interface CachedSessionMetadata {
+	mtimeMs: number;
+	size: number;
+	metadata: SessionMetadata | null;
+}
+
+interface InflightSessionMetadata {
+	mtimeMs: number;
+	size: number;
+	promise: Promise<SessionMetadata | null>;
+}
+
+const sessionMetadataCache = new Map<string, CachedSessionMetadata>();
+const sessionMetadataInflight = new Map<string, InflightSessionMetadata>();
+
+function cloneSessionMetadata(metadata: SessionMetadata): SessionMetadata {
+	return {
+		...metadata,
+		created: new Date(metadata.created),
+		modified: new Date(metadata.modified),
+	};
+}
+
+function toSessionMetadata(info: SessionInfo): SessionMetadata {
+	const { allMessagesText: _allMessagesText, ...metadata } = info;
+	return metadata;
+}
+
+async function parseSessionInfo(
+	filePath: string,
+	stats: Stats,
+	includeAllMessagesText: boolean,
+): Promise<SessionInfo | null> {
+	const content = await readFile(filePath, "utf8");
+	const entries: FileEntry[] = [];
+	const lines = content.trim().split("\n");
+
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		try {
+			entries.push(JSON.parse(line) as FileEntry);
+		} catch {
+			// Skip malformed lines
+		}
+	}
+
+	if (entries.length === 0) return null;
+	const header = entries[0];
+	if (header.type !== "session") return null;
+
+	let messageCount = 0;
+	let firstMessage = "";
+	const allMessages: string[] = [];
+	let name: string | undefined;
+
+	for (const entry of entries) {
+		// Extract session name (use latest, including explicit clears)
+		if (entry.type === "session_info") {
+			const infoEntry = entry as SessionInfoEntry;
+			name = infoEntry.name?.trim() || undefined;
+		}
+
+		if (entry.type !== "message") continue;
+		messageCount++;
+
+		const message = (entry as SessionMessageEntry).message;
+		if (!isMessageWithContent(message)) continue;
+		if (message.role !== "user" && message.role !== "assistant") continue;
+
+		const textContent = extractTextContent(message);
+		if (!textContent) continue;
+
+		if (includeAllMessagesText) allMessages.push(textContent);
+		if (!firstMessage && message.role === "user") {
+			firstMessage = textContent;
+		}
+	}
+
+	const cwd = typeof (header as SessionHeader).cwd === "string" ? (header as SessionHeader).cwd : "";
+	const parentSessionPath = (header as SessionHeader).parentSession;
+	const modified = getSessionModifiedDate(entries, header as SessionHeader, stats.mtime);
+	const created = getSessionCreatedDate(header as SessionHeader, stats.mtime);
+
+	return {
+		path: filePath,
+		id: (header as SessionHeader).id,
+		cwd,
+		name,
+		parentSessionPath,
+		created,
+		modified,
+		messageCount,
+		firstMessage: firstMessage || "(no messages)",
+		allMessagesText: allMessages.join(" "),
+	};
+}
+
+function isFilesystemError(error: unknown): boolean {
+	return typeof (error as NodeJS.ErrnoException | undefined)?.code === "string";
+}
+
+async function buildSessionInfo(filePath: string, throwOnFilesystemError = false): Promise<SessionInfo | null> {
 	try {
-		const content = await readFile(filePath, "utf8");
-		const entries: FileEntry[] = [];
-		const lines = content.trim().split("\n");
-
-		for (const line of lines) {
-			if (!line.trim()) continue;
-			try {
-				entries.push(JSON.parse(line) as FileEntry);
-			} catch {
-				// Skip malformed lines
-			}
-		}
-
-		if (entries.length === 0) return null;
-		const header = entries[0];
-		if (header.type !== "session") return null;
-
 		const stats = await stat(filePath);
-		let messageCount = 0;
-		let firstMessage = "";
-		const allMessages: string[] = [];
-		let name: string | undefined;
+		return await parseSessionInfo(filePath, stats, true);
+	} catch (error) {
+		if (throwOnFilesystemError && isFilesystemError(error)) throw error;
+		/* Corrupt session file — exclude from listing */
+		return null;
+	}
+}
 
-		for (const entry of entries) {
-			// Extract session name (use latest, including explicit clears)
-			if (entry.type === "session_info") {
-				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
-			}
-
-			if (entry.type !== "message") continue;
-			messageCount++;
-
-			const message = (entry as SessionMessageEntry).message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessages.push(textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
-			}
+async function buildSessionMetadata(filePath: string, throwOnFilesystemError = false): Promise<SessionMetadata | null> {
+	try {
+		const stats = await stat(filePath);
+		const cached = sessionMetadataCache.get(filePath);
+		if (cached?.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+			return cached.metadata ? cloneSessionMetadata(cached.metadata) : null;
 		}
 
-		const cwd = typeof (header as SessionHeader).cwd === "string" ? (header as SessionHeader).cwd : "";
-		const parentSessionPath = (header as SessionHeader).parentSession;
+		const inflight = sessionMetadataInflight.get(filePath);
+		if (inflight?.mtimeMs === stats.mtimeMs && inflight.size === stats.size) {
+			const metadata = await inflight.promise;
+			return metadata ? cloneSessionMetadata(metadata) : null;
+		}
 
-		const modified = getSessionModifiedDate(entries, header as SessionHeader, stats.mtime);
-		const created = getSessionCreatedDate(header as SessionHeader, stats.mtime);
-
-		return {
-			path: filePath,
-			id: (header as SessionHeader).id,
-			cwd,
-			name,
-			parentSessionPath,
-			created,
-			modified,
-			messageCount,
-			firstMessage: firstMessage || "(no messages)",
-			allMessagesText: allMessages.join(" "),
-		};
-	} catch {
+		const promise = parseSessionInfo(filePath, stats, false).then((info) => {
+			const metadata = info ? toSessionMetadata(info) : null;
+			sessionMetadataCache.set(filePath, {
+				mtimeMs: stats.mtimeMs,
+				size: stats.size,
+				metadata: metadata ? cloneSessionMetadata(metadata) : null,
+			});
+			return metadata;
+		});
+		const current = { mtimeMs: stats.mtimeMs, size: stats.size, promise };
+		sessionMetadataInflight.set(filePath, current);
+		try {
+			const metadata = await promise;
+			return metadata ? cloneSessionMetadata(metadata) : null;
+		} finally {
+			if (sessionMetadataInflight.get(filePath) === current) sessionMetadataInflight.delete(filePath);
+		}
+	} catch (error) {
+		if (throwOnFilesystemError && isFilesystemError(error)) throw error;
 		/* Corrupt session file — exclude from listing */
 		return null;
 	}
@@ -642,38 +886,84 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 
 export type SessionListProgress = (loaded: number, total: number) => void;
 
+async function collectSessionMetadata(
+	files: string[],
+	isInScope: (cachedPath: string) => boolean,
+	onProgress?: SessionListProgress,
+	throwOnFilesystemError = false,
+): Promise<SessionMetadata[]> {
+	// Prune cache entries for deleted files, but only within the scanned scope so
+	// default and custom-directory listings don't evict each other's entries.
+	const currentFiles = new Set(files);
+	for (const cachedPath of sessionMetadataCache.keys()) {
+		if (isInScope(cachedPath) && !currentFiles.has(cachedPath)) sessionMetadataCache.delete(cachedPath);
+	}
+	let loaded = 0;
+	const results = await Promise.all(
+		files.map(async (file) => {
+			const metadata = await buildSessionMetadata(file, throwOnFilesystemError);
+			loaded++;
+			onProgress?.(loaded, files.length);
+			return metadata;
+		}),
+	);
+	const sessions = results.filter((metadata): metadata is SessionMetadata => metadata !== null);
+	sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+	return sessions;
+}
+
+async function listAllSessionFiles(): Promise<string[]> {
+	const sessionsDir = getSessionsDir();
+	if (!existsSync(sessionsDir)) return [];
+	const entries = await readdir(sessionsDir, { withFileTypes: true });
+	const dirs = entries.filter((entry) => entry.isDirectory()).map((entry) => join(sessionsDir, entry.name));
+	const dirFiles = await Promise.all(
+		dirs.map(async (dir) =>
+			(await readdir(dir)).filter((file) => file.endsWith(".jsonl")).map((file) => join(dir, file)),
+		),
+	);
+	return dirFiles.flat();
+}
+
 async function listSessionsFromDir(
 	dir: string,
 	onProgress?: SessionListProgress,
 	progressOffset = 0,
 	progressTotal?: number,
+	throwOnFilesystemError = false,
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
-	if (!existsSync(dir)) {
+	if (!throwOnFilesystemError && !existsSync(dir)) {
 		return sessions;
 	}
 
+	let dirEntries: string[];
 	try {
-		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
-		const total = progressTotal ?? files.length;
+		dirEntries = await readdir(dir);
+	} catch (error) {
+		if (throwOnFilesystemError && (error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
+		return sessions;
+	}
 
+	const files = dirEntries.filter((file) => file.endsWith(".jsonl")).map((file) => join(dir, file));
+	const total = progressTotal ?? files.length;
+
+	try {
 		let loaded = 0;
 		const results = await Promise.all(
 			files.map(async (file) => {
-				const info = await buildSessionInfo(file);
+				const info = await buildSessionInfo(file, throwOnFilesystemError);
 				loaded++;
 				onProgress?.(progressOffset + loaded, total);
 				return info;
 			}),
 		);
 		for (const info of results) {
-			if (info) {
-				sessions.push(info);
-			}
+			if (info) sessions.push(info);
 		}
-	} catch {
-		/* Session directory read failed — return partial results */
+	} catch (error) {
+		if (throwOnFilesystemError) throw error;
+		/* Session file read failed — return partial results */
 	}
 
 	return sessions;
@@ -694,6 +984,7 @@ export class SessionManager {
 	private sessionId: string = "";
 	private sessionFile: string | undefined;
 	private sessionDir: string;
+	private customSessionInventoryRoot: string | undefined;
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
@@ -702,9 +993,16 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 
-	private constructor(cwd: string, sessionDir: string, sessionFile: string | undefined, persist: boolean) {
+	private constructor(
+		cwd: string,
+		sessionDir: string,
+		sessionFile: string | undefined,
+		persist: boolean,
+		customSessionInventoryRoot?: string,
+	) {
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
+		this.customSessionInventoryRoot = customSessionInventoryRoot;
 		this.persist = persist;
 		if (persist && sessionDir && !existsSync(sessionDir)) {
 			mkdirSync(sessionDir, { recursive: true });
@@ -842,6 +1140,14 @@ export class SessionManager {
 		return this.sessionDir;
 	}
 
+	/**
+	 * Flat inventory root selected explicitly for this manager, if any.
+	 * Built-in per-project managers and in-memory managers return undefined.
+	 */
+	getCustomSessionInventoryRoot(): string | undefined {
+		return this.customSessionInventoryRoot;
+	}
+
 	getSessionId(): string {
 		return this.sessionId;
 	}
@@ -860,14 +1166,14 @@ export class SessionManager {
 			return;
 		}
 
-		if (!this.flushed) {
-			for (const e of this.fileEntries) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(e)}\n`);
-			}
-			this.flushed = true;
-		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+		const records = this.flushed ? [entry] : this.fileEntries;
+		// Start on a fresh line if the file's last record is unterminated (see endsWithoutNewline).
+		let prefix = endsWithoutNewline(this.sessionFile) ? "\n" : "";
+		for (const record of records) {
+			appendFileSync(this.sessionFile, `${prefix}${JSON.stringify(record)}\n`);
+			prefix = "";
 		}
+		this.flushed = true;
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
@@ -1357,9 +1663,11 @@ export class SessionManager {
 	 * @param cwd Working directory (stored in session header)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.dreb/agent/sessions/<encoded-cwd>/).
 	 */
-	static create(cwd: string, sessionDir?: string): SessionManager {
+	static create(cwd: string, sessionDir?: string, options: { customSessionInventory?: boolean } = {}): SessionManager {
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
-		return new SessionManager(cwd, dir, undefined, true);
+		const customInventoryRoot =
+			sessionDir !== undefined && options.customSessionInventory !== false ? sessionDir : undefined;
+		return new SessionManager(cwd, dir, undefined, true, customInventoryRoot);
 	}
 
 	/**
@@ -1374,7 +1682,7 @@ export class SessionManager {
 		const cwd = header?.cwd ?? process.cwd();
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ?? resolve(path, "..");
-		return new SessionManager(cwd, dir, path, true);
+		return new SessionManager(cwd, dir, path, true, sessionDir);
 	}
 
 	/**
@@ -1386,14 +1694,14 @@ export class SessionManager {
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
 		const mostRecent = findMostRecentSession(dir);
 		if (mostRecent) {
-			return new SessionManager(cwd, dir, mostRecent, true);
+			return new SessionManager(cwd, dir, mostRecent, true, sessionDir);
 		}
-		return new SessionManager(cwd, dir, undefined, true);
+		return new SessionManager(cwd, dir, undefined, true, sessionDir);
 	}
 
-	/** Create an in-memory session (no file persistence) */
-	static inMemory(cwd: string = process.cwd()): SessionManager {
-		return new SessionManager(cwd, "", undefined, false);
+	/** Create an in-memory session (no active-file persistence), optionally retaining a flat inventory root. */
+	static inMemory(cwd: string = process.cwd(), customSessionInventoryRoot?: string): SessionManager {
+		return new SessionManager(cwd, "", undefined, false, customSessionInventoryRoot);
 	}
 
 	/**
@@ -1443,7 +1751,7 @@ export class SessionManager {
 			}
 		}
 
-		return new SessionManager(targetCwd, dir, newSessionFile, true);
+		return new SessionManager(targetCwd, dir, newSessionFile, true, sessionDir);
 	}
 
 	/**
@@ -1517,6 +1825,46 @@ export class SessionManager {
 	}
 
 	/**
+	 * Rename a persisted session by path by appending a `session_info` entry, the same record
+	 * `/name` and the `/resume` picker write. Empty names are rejected (no clearing).
+	 *
+	 * The path is checked first with {@link checkSessionFile}, because {@link SessionManager.open}
+	 * truncates header-less files and creates missing directories. After appending, the file is
+	 * re-read to confirm the name was saved: entries are held in memory until a session has an
+	 * assistant reply, so a header-only session would otherwise "succeed" without writing anything.
+	 *
+	 * A process that already has the session open does not see this write and may later rewrite
+	 * the file without it. Callers that can reach that process (e.g. a dashboard runtime) should
+	 * rename through it instead.
+	 */
+	static renameSession(sessionPath: string, name: string): { ok: true; name: string } | { ok: false; error: string } {
+		const nextName = name.trim();
+		if (!nextName) {
+			return { ok: false, error: "Session name cannot be empty" };
+		}
+
+		const check = checkSessionFile(sessionPath);
+		if (!check.ok) return check;
+
+		try {
+			SessionManager.open(check.path).appendSessionInfo(nextName);
+			const persisted = readPersistedSessionName(check.path);
+			if (persisted !== nextName) {
+				return {
+					ok: false,
+					error:
+						`Session name was not saved to ${sessionPath}: the file does not record it after writing ` +
+						"(sessions without an assistant reply are not written to disk yet)",
+				};
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return { ok: false, error: `Failed to rename session ${sessionPath}: ${message}` };
+		}
+		return { ok: true, name: nextName };
+	}
+
+	/**
 	 * List all sessions for a directory.
 	 * @param cwd Working directory (used to compute default session directory)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.dreb/agent/sessions/<encoded-cwd>/).
@@ -1530,52 +1878,65 @@ export class SessionManager {
 	}
 
 	/**
+	 * List every session stored directly in one explicit flat directory.
+	 * This is intentionally separate from listAll(), whose default contract scans
+	 * the built-in nested all-project tree.
+	 */
+	static async listAllFromDir(dir: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+		const sessions = await listSessionsFromDir(dir, onProgress, 0, undefined, true);
+		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+		return sessions;
+	}
+
+	/**
+	 * List lightweight metadata for every session stored directly in one explicit flat directory.
+	 * Uses the same mtime/size cache as listAllMetadata(); filesystem errors propagate.
+	 */
+	static async listAllMetadataFromDir(dir: string, onProgress?: SessionListProgress): Promise<SessionMetadata[]> {
+		let dirEntries: string[];
+		try {
+			dirEntries = await readdir(dir);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return [];
+			throw error;
+		}
+		const files = dirEntries.filter((file) => file.endsWith(".jsonl")).map((file) => join(dir, file));
+		const scope = resolve(dir);
+		return collectSessionMetadata(files, (cachedPath) => dirname(resolve(cachedPath)) === scope, onProgress, true);
+	}
+
+	/**
 	 * List all sessions across all project directories.
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
 	static async listAll(onProgress?: SessionListProgress): Promise<SessionInfo[]> {
-		const sessionsDir = getSessionsDir();
-
 		// A missing sessions directory is a legitimate empty state (fresh install), not a
-		// failure — return []. Any actual I/O failure below propagates loudly so callers can
-		// distinguish "no sessions" from "listing failed" (RPC responds success:false; the TUI
-		// selector surfaces "Failed to load sessions"). No silent catch-and-return-[].
-		if (!existsSync(sessionsDir)) {
-			return [];
-		}
-		const entries = await readdir(sessionsDir, { withFileTypes: true });
-		const dirs = entries.filter((e) => e.isDirectory()).map((e) => join(sessionsDir, e.name));
-
-		// Count total files first for accurate progress
-		let totalFiles = 0;
-		const dirFiles: string[][] = [];
-		for (const dir of dirs) {
-			const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
-			dirFiles.push(files.map((f) => join(dir, f)));
-			totalFiles += files.length;
-		}
-
-		// Process all files with progress tracking
+		// failure. Actual I/O failures propagate so callers can distinguish "no sessions"
+		// from "listing failed".
+		const allFiles = await listAllSessionFiles();
 		let loaded = 0;
-		const sessions: SessionInfo[] = [];
-		const allFiles = dirFiles.flat();
-
 		const results = await Promise.all(
 			allFiles.map(async (file) => {
 				const info = await buildSessionInfo(file);
 				loaded++;
-				onProgress?.(loaded, totalFiles);
+				onProgress?.(loaded, allFiles.length);
 				return info;
 			}),
 		);
-
-		for (const info of results) {
-			if (info) {
-				sessions.push(info);
-			}
-		}
-
+		const sessions = results.filter((info): info is SessionInfo => info !== null);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
+	}
+
+	/**
+	 * List lightweight metadata across all project directories.
+	 *
+	 * Results are cached by file mtime and size, so dashboard inventory refreshes
+	 * stat every session but only reread and parse files that changed.
+	 */
+	static async listAllMetadata(onProgress?: SessionListProgress): Promise<SessionMetadata[]> {
+		const allFiles = await listAllSessionFiles();
+		const scope = resolve(getSessionsDir()) + sep;
+		return collectSessionMetadata(allFiles, (cachedPath) => resolve(cachedPath).startsWith(scope), onProgress);
 	}
 }

@@ -33,6 +33,12 @@ install instructions (`npm install -g @dreb/dashboard`).
 
 Open `http://127.0.0.1:5343` on the same machine.
 
+## Session inventory roots
+
+Dashboard snapshots main-session storage at startup. Its host-wide inventory reads only the global `sessionDir` from `<agent-dir>/settings.json`; a project `.dreb/settings.json` in the launch directory cannot redirect Fleet, `/api/sessions`, resync, resume, rename, or delete. A configured root is a flat JSONL store. Without one, Dashboard scans the built-in nested all-project tree.
+
+Absolute paths remain absolute, `~` expands from the home directory, and relative paths resolve against Dashboard's startup cwd; an absolute global path is recommended. Restart Dashboard after changing the setting. The separate global-only `subagentSessionDir` controls new child logs in coding-agent runtimes, while restart recovery can also discover matching logs in the legacy root. Neither setting migrates files or relocates credentials or general configuration. See [Session settings](settings.md#sessions).
+
 ## Local vs remote — exactly two modes
 
 **Local-only (default).** The server binds `127.0.0.1` exclusively. Machines
@@ -78,6 +84,14 @@ Layers, in order, all fail-closed (any auth-subsystem error denies):
 
 **There is no LAN mode.** The server never listens on a LAN-reachable
 interface without Tailscale identity enforcement.
+
+Protected API paths use a case-insensitive `/api` segment boundary, matching
+Express routing. Changing `/api` to `/API` or `/Api` cannot bypass a denial:
+non-allowlisted identities receive 403 and allowlisted-but-unpaired devices
+receive 401 for protected GETs, including file downloads and live SSE events.
+Resolved identities may still load the SPA shell and static assets for the
+pairing/denial screens; the intended auth/pairing exceptions do not expose
+protected data handlers. A bare API namespace is not an SPA-shell route.
 
 ### What a paired device can do
 
@@ -132,19 +146,134 @@ networking window above.
 
 | Screen | What it does |
 |---|---|
-| **Fleet** | Home. Live-first: one grid of every live session at the top — status chip (● running / ◆ needs-attention / ○ idle / ✕ error), project path, activity line, live subagent lines, tasks progress, ctx%, model, terminal provider-error reason, last activity. Live cards keep a deterministic order by project path, then session start time; needs-attention cards badge the browser tab without jumping around. Below the grid: past sessions grouped by their historical project, three compact rows per group with an "all N on disk" expander, resume and delete. Sessions remain visible when that historical directory is missing; resume opens an explicit runtime-directory chooser instead of mutating or hiding the session. |
-| **Session view** | Full chat drill-in. Markdown streaming transcript (text, thinking blocks with expand preference, inline provider/API failures with partial output preserved, agent-result cards, tool cards with bespoke read/write/edit/bash bodies plus full expandable inputs, markdown-rendered results for markdown-contract tools like subagent/skill/web_fetch/suggest_next, and inline tool-result images, compaction/branch summaries, custom messages), per-message copy, tasks panel, a bounded scrollable subagent panel that lists every retained agent newest-first with full running/done counts, a shared dismissible banner region for model fallback, extension notices, retry/compaction/paused/provider status, and local action results, a controls-only dock line with elapsed time plus ■ stop and explicitly labelled retry/compaction aborts, a persistent session-header live indicator, and an info bar with cwd, original-session provenance when a historical session is resumed in a different runtime directory, branch, session name, token breakdown, cost/(sub)/daily rollup, ctx%, a TUI-parity latest-100 median TPS indicator (`~31 tok/s [100] · 10% ↑ median [10000]`), and a stats popover. A fleet sidebar lists every other live session beside the transcript with the fleet cards' project, status/reasons, activity/latest-assistant preview, running/done subagent summaries, task progress, model, context, cost, message count, last activity, and any original-session provenance, deterministically ordered by project path then session start time (the fleet page's comparator), so needs-attention/error entries are emphasized — a filled attention chip or outlined error chip plus an entry border — without moving position; clicking an entry navigates to that session, desktop collapse and pointer/keyboard-resizable width persist browser-locally (default expanded, 260px), the hidden toggle border reflects the highest-priority other-session status, and neither sidebar nor toggle renders when no other live sessions exist. The subagent drill-in shows the same sidebar with its parent session excluded. Closed-session banners offer direct resume when the captured runtime directory still exists and an explicit directory chooser when the historical directory is missing or should be replaced. Composer supports auto-grow, history, `/` autocomplete from `get_commands`, image attach/paste with sent images retained as user-message previews, queued-message chips with restore-all, steer/follow-up modes, and suggest-next. Registered built-in slash commands are discovered generically, deduplicated ahead of colliding resource commands, and intercepted before prompting: dashboard actions cover settings, model, scoped-models, export/import, name/session stats, fork/tree, new/compact/dream, resume/reload, and quit. `/scoped-models` deep-links to the Settings editor with the session's current cwd as project context; login/logout show an explicit not-yet-implemented notice, while copy/hotkeys/buddy give terminal-only guidance. Future built-ins are intercepted automatically. The RPC prompt boundary rejects any built-in that reaches it during command-loading races or failures, so slash text cannot leak to the model. Attachments are retained and the command is visibly rejected rather than silently discarded. The ⋯ menu covers export HTML, compact, rename, fork-from-message, loaded context, and tool expand/collapse. Session names update live from manual rename or auto-naming. Extension UI requests for select/confirm/input/editor render as modals; a rich `ask`/`ask_user` request renders inline as a single wizard that presents all its questions together — each with Markdown-formatted question text, choices, optional free text — plus an in-card Stop agent action, Escape-to-stop, and the authoritative auto-stop countdown, and is answered as one batch submit. Pending questions set needs-attention state and use the existing hidden-page notification path. Extension notifications for the viewed session render in its banner region; other sessions' and app-global notices use the fixed top-center toast stack. |
-| **Subagent view** | Transcript of a background agent: live events via the RPC relay, hydrated from the agent's on-disk session log (`/subagents/:agentId/messages`) so the transcript survives browser reloads. Shows the task, streaming output, tool activity, and any safe Dispatch Arbiter changed/unchanged/failure records with the final agent/model/thinking. No raw arbiter output is displayed or transported. While the child is running, a composer sends the user's text unchanged to that specific child as steering input, displays its pending steering queue, and reports its effective `one-at-a-time` or `all` delivery mode. Completed, failed, rehydrated, and unavailable children remain read-only. |
+| **Fleet** | Home. Live-first: one grid of every live session at the top — status chip (● running / ◆ needs-attention / ○ idle / ✕ error), project path, activity line, live subagent lines, tasks progress, ctx%, model, terminal provider-error reason, last activity. Default keeps live cards in stable effective-project-path/runtime-start order; status changes never determine card order. [Fleet sorting](#fleet-sorting) integrates browser-local sorting buttons into the live section header, with live activity reordering only when Last activity is explicitly selected; needs-attention cards still badge the browser tab. [Fleet search and filters](#fleet-search-and-filters) narrows live and past sessions by displayed name or project path, and the live/needs-attention counts double as a live-only attention filter. Below the grid: one native past-session table with global column headings, grouped by historical project, three compact rows per group with an "all N on disk" expander, and resume, [rename](#renaming-past-sessions) (with an optional auto-generated title), and delete on every row. Sessions remain visible when that historical directory is missing; resume opens an explicit runtime-directory chooser instead of mutating or hiding the session. |
+| **Session view** | Full chat drill-in. Markdown streaming transcript (text, thinking blocks with expand preference, inline provider/API failures with partial output preserved, agent-result cards, tool cards with bespoke read/write/edit/bash bodies plus full expandable inputs, markdown-rendered results for markdown-contract tools like subagent/skill/web_fetch/suggest_next, and inline tool-result images, compaction/branch summaries, custom messages), per-message copy, tasks panel, a bounded scrollable subagent panel that lists every retained agent newest-first with full running/done counts, a shared dismissible banner region for model fallback, extension notices, retry/compaction/paused/provider status, and local action results, a controls-only dock line with elapsed time plus ■ stop and explicitly labelled retry/compaction aborts, a persistent session-header live indicator, and an info bar with cwd, original-session provenance when a historical session is resumed in a different runtime directory, branch, session name, token breakdown, cost/(sub)/daily rollup, ctx%, a TUI-parity latest-100 median TPS indicator (`~31 tok/s [100] · 10% ↑ median [10000]`), and a stats popover. A fleet sidebar lists every other live session beside the transcript with the fleet cards' project, status/reasons, activity/latest-assistant preview, running/done subagent summaries, task progress, model, context, cost, message count, last activity, and any original-session provenance, deterministically ordered by effective project path then runtime start time independently of the Fleet page's selected sort, so needs-attention/error entries are emphasized — a filled attention chip or outlined error chip plus an entry border — without moving position; clicking an entry navigates to that session, desktop collapse and pointer/keyboard-resizable width persist browser-locally (default expanded, 260px), the hidden toggle border reflects the highest-priority other-session status, and neither sidebar nor toggle renders when no other live sessions exist. The subagent drill-in shows the same sidebar with its parent session excluded. Closed-session banners offer direct resume when the captured runtime directory still exists and an explicit directory chooser when the historical directory is missing or should be replaced. Composer supports auto-grow, history, `/` autocomplete from `get_commands`, image attach/paste with sent images retained as user-message previews, queued-message chips with restore-all, steer/follow-up modes, and suggest-next. Registered built-in slash commands are discovered generically, deduplicated ahead of colliding resource commands, and intercepted before prompting: dashboard actions cover settings, model, scoped-models, export/import, name/session stats, fork/tree, new/compact/dream, resume/reload, and quit. `/scoped-models` deep-links to the Settings editor with the session's current cwd as project context; login/logout show an explicit not-yet-implemented notice, while copy/hotkeys/buddy give terminal-only guidance. Future built-ins are intercepted automatically. The RPC prompt boundary rejects any built-in that reaches it during command-loading races or failures, so slash text cannot leak to the model. Attachments are retained and the command is visibly rejected rather than silently discarded. The ⋯ menu covers export HTML, compact, rename, fork-from-message, loaded context, and tool expand/collapse. Session names update live from manual rename or auto-naming. Extension UI requests for select/confirm/input/editor render as modals; a rich `ask`/`ask_user` request renders inline as a single wizard that presents all its questions together — each with Markdown-formatted question text, choices, optional free text — plus an in-card Stop agent action, Escape-to-stop, and the authoritative auto-stop countdown, and is answered as one batch submit. Pending questions set needs-attention state and use the existing hidden-page notification path. Extension notifications for the viewed session render in its banner region; other sessions' and app-global notices use the fixed top-center toast stack. |
+| **Subagent view** | Transcript of a background agent: live events via the RPC relay, hydrated from the agent's on-disk session log (`/subagents/:agentId/messages`) so the transcript survives browser reloads. Shows the task, streaming output, tool activity, and any safe Dispatch Arbiter changed/unchanged/failure records with the final agent/model/thinking. No raw arbiter output is displayed or transported. While the child is running, a composer sends the user's text unchanged to that specific child as steering input, displays its pending steering queue, and reports its effective `one-at-a-time` or `all` delivery mode, and the dock shows a **■ stop** (styled like the session view's) that stops only that child — see [Stopping a subagent](#stopping-a-subagent). Completed, failed, cancelled, rehydrated, and unavailable children remain read-only. |
 | **Files** | Host-wide browser with places shortcuts (home, /tmp, project roots), breadcrumbs to `/`, new-folder, download, drop-zone/picker upload with explicit collision prompts, and "new session here" on any directory. It also shows the **effective global nested-context trust** for the displayed canonical directory: untrusted, trusted by that root, inherited from a granting root, or global expert trust-all. You can trust the displayed folder and descendants, or untrust the actual granting root; untrusting an inherited folder removes that root's trust for all descendants. |
 | **Memories** | Dreb-only memory management for `~/.dreb/memory` and `.dreb/memory` under active/disk project roots. It lists existing `MEMORY.md` indexes and direct child `.md` entries only (no Claude paths, create, or rename), shows entry frontmatter or metadata errors so malformed files can be repaired, renders sanitized Markdown preview beside a raw editor, and uses exact SHA-256 revisions so stale saves/deletes return conflicts while preserving drafts. The index view is complete, not truncated, and warns when it exceeds the 200-line memory-index convention. Entry deletion requires both entry and index revisions, removes only matching safe Markdown-link index lines (`file.md` / `./file.md`), writes the cleaned index atomically before unlinking the entry, and rolls back loudly if the unlink fails. |
-| **Settings** | Persistent defaults (default model, thinking level, steering/follow-up queue modes, auto-compaction, opt-in continuation of pending work after successful automatic compaction, auto-retry) via `get_settings`/`set_settings` — validation errors are shown verbatim. The continuation option is off by default, can keep unattended model turns and costs running indefinitely, does not restart completed answers, and never affects manual `/compact`. The tab-title card exposes the default-enabled generator toggle and an exact authenticated `provider/model` picker; an unset model clearly retains Explore-agent routing, a pinned model can be cleared back to that route, and edits apply to new unnamed sessions. The scoped-models editor controls model cycling for new sessions only: grouped search, model/provider/all toggles, responsive controls, accessible up/down partial-scope ordering, and save/reset. An absent `enabledModels` is future-inclusive all models in registry order and cannot be reordered; a partial scope is a non-empty ordered list of canonical `provider/model` references. Editing legacy glob, fuzzy, or thinking-suffix values saves normalized exact references. The selected context reads effective global + project settings but writes global; a project-level `enabledModels` shadow is warned. The global-only Dispatch Arbiter card exposes enable/disable, exact authenticated model selection, thinking, guide path, and readiness guidance; model-less enablement is blocked and RPC/runtime validation remains fail-closed. Entering Settings flushes pending writes and reloads durable global + project settings, so external edits appear; read, parse, or write failures fail loudly instead of showing stale settings. The global-only nested-context policy lists every explicit trusted root for audit and revoke, offers a simple add-by-path control, and includes a prominently warned expert trust-all toggle; the Files view remains the primary place to grant trust while browsing. Most defaults seed new sessions, including **Max concurrent subagents** (default 4). Setting it to 0 starts new parents without the subagent tool and tells the parent model to perform normally delegated work itself; positive values cap running children per parent session. Context-trust changes are observed by active main/subagent processes for future lazy loads, but cannot remove already injected content. Dashboard-local preferences (always expand thinking, transcript image display mode, needs-attention notification permission) live in the browser, alongside an appearance section: a theme gallery of eight curated themes (entropist.ca, Dim, Solarized, Gruvbox, Caves of Qud, Van Gogh, and the colorblind-safe Okabe-Ito and Paul Tol) with live preview cards plus system/light/dark mode and Theme default/IBM Plex Mono/JetBrains Mono/Fira Code/Iosevka/OpenDyslexic/Atkinson Hyperlegible font selectors, saved per browser. Shows the current rotating pairing code on the host/local dashboard, the 1–3650 day lifetime used only for future pairings (180-day default), and paired-device expiry dates with unpair. |
+| **Settings** | Persistent defaults (default model, thinking level, steering/follow-up queue modes, auto-compaction, opt-in continuation of pending work after successful automatic compaction, auto-retry) via `get_settings`/`set_settings` — validation errors are shown verbatim. The continuation option is off by default, can keep unattended model turns and costs running indefinitely, does not restart completed answers, and never affects manual `/compact`. The tab-title card exposes the default-enabled generator toggle and an exact authenticated `provider/model` picker; an unset model clearly retains Explore-agent routing, a pinned model can be cleared back to that route, and edits apply to new unnamed sessions. The scoped-models editor controls model cycling for new sessions only: grouped search, model/provider/all toggles, responsive controls, accessible up/down partial-scope ordering, and save/reset. An absent `enabledModels` is future-inclusive all models in registry order and cannot be reordered; a partial scope is a non-empty ordered list of canonical `provider/model` references. Editing legacy glob, fuzzy, or thinking-suffix values saves normalized exact references. The selected context reads effective global + project settings but writes global; a project-level `enabledModels` shadow is warned. The global-only Dispatch Arbiter card exposes enable/disable, exact authenticated model selection, thinking, guide path, and readiness guidance; model-less enablement is blocked and RPC/runtime validation remains fail-closed. Entering Settings flushes pending writes and reloads durable global + project settings, so external edits appear; read, parse, or write failures fail loudly instead of showing stale settings. The global-only nested-context policy lists every explicit trusted root for audit and revoke, offers a simple add-by-path control, and includes a prominently warned expert trust-all toggle; the Files view remains the primary place to grant trust while browsing. Most defaults seed new sessions, including **Max concurrent subagents** (default 4). Setting it to 0 starts new parents without the subagent tool and tells the parent model to perform normally delegated work itself; positive values cap running children per parent session. Context-trust changes are observed by active main/subagent processes for future lazy loads, but cannot remove already injected content. Dashboard-local preferences (always expand thinking, transcript image display mode, needs-attention notification permission) live in the browser, alongside an appearance section: a theme gallery of eight curated themes (entropist.ca, Dim, Solarized, Gruvbox, Caves of Qud, Van Gogh, and the colorblind-safe Okabe-Ito and Paul Tol) with live preview cards plus system/light/dark mode and a font picker with 36 explicit choices plus Theme default (the existing IBM Plex Mono/JetBrains Mono/Fira Code/Iosevka/OpenDyslexic/Atkinson Hyperlegible plus 15 sans-serif and 15 serif families), regular-face previews in the open listbox, saved per browser. Shows the current rotating pairing code on the host/local dashboard, the 1–3650 day lifetime used only for future pairings (180-day default), and paired-device expiry dates with unpair. |
 | **Pairing** | Remote first-login: identity echo, rotating-code entry, and the security copy explaining what pairing grants. |
+
+### Fleet search and filters
+
+Use **Search sessions** to find a displayed session name or project path across
+live cards and historical sessions. Matching is a case-insensitive substring,
+ignoring leading/trailing spaces. Current live renames and displayed fallback
+names are included; unnamed historical rows use the first-message fallback
+already shown in the list. Full project paths and displayed `~/…` aliases match.
+Live cards use their effective runtime directory, while history uses its recorded
+CWD, not a canonical replacement directory or opaque session-file path. Existing
+`/tmp` grouping and exact-path resume/rename/delete identities remain unchanged. This
+search covers metadata, **not full conversation text**.
+
+The existing **needs attention** count is a toggle that filters live sessions;
+click it again or click the **live** count to show all live cards. Search and
+attention combine, but attention never filters historical rows. Pressed state
+and the live-only result note explain the active scope. Heading counts remain
+global inventory totals, while result counts describe all matching sessions
+before historical previews, not only the currently visible rows.
+
+Historical search considers the full inventory before grouping, sorting and
+three-row previews. Groups rank by the first matching sorted member. A hidden
+live card's exact session file never reappears as a historical result. Expanded
+projects stay expanded when filters or sorting change. **Clear filters** clears
+search and attention without changing sorting; sorting's **Reset** leaves filters
+intact. No-match messages keep section controls usable and are distinct from an
+actually empty inventory. The labelled native controls support keyboard use and
+44px touch targets at <=700px.
+
+Search and attention state belong only to the mounted Fleet screen: navigation
+away or reload clears them. The existing browser-local sort preference still
+persists. No host/session settings, storage keys, dependencies, polling, backend
+requests or transcript hydration are added. Session and subagent sidebars are
+not filtered and retain their stable ordering.
+
+### Fleet sorting
+
+Fleet home integrates native sorting buttons into its headers instead of a
+separate sort-key/direction toolbar. The live section header offers **Session**,
+**Created**, **Started**, **Last activity**, **Project**, and **Reset** above the
+unchanged live card grid. Session selects Session name, Created selects Session
+created, Started selects Runtime started (live only), and Project selects Project
+path.
+
+Past sessions use **one native grouped table**, not a separate table per project.
+Its global column headings are **Session**, **Created**, **Last activity**,
+**Messages** (informational, not sortable), and **Actions**. The first three
+headings contain sorting buttons; **Project** and **Reset** are in the past
+section header. Project-header rows and three-row previews/expansion remain.
+
+Click a sort header to select its key: dates initially sort descending
+(newest-first), names and paths ascending. Clicking the selected key reverses
+its direction. Arrows and accessible button state communicate the selected key
+and direction; sortable table headings also expose `aria-sort`. **Reset** restores
+**Default**. Sorting buttons support native keyboard activation. At <=700px,
+they provide 44px touch targets and table rows stack while accessible column
+headings and sorting buttons remain available.
+
+The six modes remain **Default**, **Last activity**, **Session created**,
+**Runtime started (live only)**, **Session name**, and **Project path**; there is
+no status sort. Default has a fixed order. Every non-default key supports both
+directions: oldest/newest for dates and ascending/descending text order for names
+and paths.
+
+| Key | Live grid | Past sessions |
+|---|---|---|
+| **Default** | Effective project path ascending, then current runtime start ascending, with stable identity ties | Newest `modified` first within each project; groups newest first, with stable ties |
+| **Last activity** | Existing runtime `lastActivity` | Existing `modified` conversation-activity value, not a newly defined filesystem mtime |
+| **Session created** | Original inventory `created`, matched only by inventory `path` to `runtime.state.sessionFile` | Original inventory `created` |
+| **Runtime started (live only)** | Current live runtime `createdAt` | Default newest-first rows and groups in either direction; past sessions have no current runtime start |
+| **Session name** | The name or fallback displayed on the live card | The name or first-message fallback displayed on the historical row |
+| **Project path** | Effective runtime `cwd` | Recorded historical `cwd` |
+
+**Session created** for a live card is **unknown** until matching inventory is
+available; live cards do not wait for the inventory scan. Never substitute runtime
+`createdAt`, or match by name or project path, for original creation. Late
+matching inventory can move a previously unknown entry to its known position.
+A new session's file is written only with its first assistant reply, after the
+inventory read that accompanies its creation (or `/new`). The client therefore
+re-reads the disk list once that runtime is idle with messages newer than the
+read that missed its file, so the session moves to its creation position after
+its first turn instead of staying last. While Session created is selected, a
+visible note under the live heading counts the displayed live sessions (after
+any search/attention filter) with no known creation date yet.
+Missing or invalid dates sort **after known dates in both directions**. Equal
+primary values retain deterministic identity tiebreaks; reversing direction
+does not reverse those ties. Name/path comparisons are case-insensitive with
+deterministic fallback.
+
+Historical project groups remain intact, including existing `/tmp` folding.
+Sort **all rows in each group before taking the first three** for its collapsed
+preview. For non-default keys applicable to history, rank groups by the selected
+primary value of their leading sorted member, with a stable project-key tie.
+Default ranks groups newest-first; Runtime started explicitly leaves both
+historical rows and groups on that default in either direction. Expansion state,
+resume-directory selection, and resume/rename/delete targets are unchanged by sorting.
+
+Selecting **Last activity** explicitly opts Fleet into live reordering as
+existing updates arrive. Default never moves cards for activity or attention
+changes. Other selected sorts respond to their selected key, including live
+renames or newly available original creation dates. Session and subagent fleet
+sidebars always keep their stable effective-path/runtime-start order, regardless
+of the Fleet selection.
+
+One shared key/direction pair applies across the live and past sections and all
+project groups; project headers do not have independent preferences. It persists
+only in browser `localStorage` under `dreb.dashboard.fleetSort`, not host settings
+or session files. Missing, malformed, or invalid preferences fall back to Default;
+unavailable storage leaves the selection usable in memory. Sorting uses existing
+snapshots and inventory only:
+no new polling, network requests, transcript hydration, data fields, or
+dependencies are added. Choosing or changing a sort never fetches anything; the
+only related inventory read is the post-first-turn re-read for an unindexed live
+session file described above, which happens regardless of the selected sort.
 
 ### Fleet sidebar controls and session switching
 
-The sidebar uses the same display summary as fleet-page cards, but its entire
-card navigates rather than adding a destructive stop-runtime button. Activity
-prefers working text, then a suggested-next command, then the latest nonblank
+The sidebar uses the same display summary as fleet-page cards, but keeps its
+stable effective-project-path/runtime-start order independently of Fleet sorting.
+Its entire card navigates rather than adding a destructive stop-runtime button.
+Activity prefers working text, then a suggested-next command, then the latest nonblank
 assistant text (bounded to 200 characters), with the server's preview as fallback
 for an unvisited transcript. It shows running/done counts and up to three live
 subagent summaries; unavailable optional metadata is omitted.
@@ -325,25 +454,84 @@ retry stays clear. Disabled retry, non-retryable errors, and exhausted retry
 remain terminal, and exhausted retry upserts the same status instead of
 duplicating it.
 
+### Renaming past sessions
+
+Every past-session row has **rename** between resume and delete. The rename
+modal starts with the session's current name (unnamed sessions start empty,
+with the first message as a placeholder). Confirming saves the trimmed name as a
+`session_info` entry, the same record `/name` and the TUI `/resume` picker write.
+Empty names are rejected; renaming does not clear a name. The list refreshes and
+other open dashboards update through the `disk_sessions_changed` event.
+
+**auto-generate** suggests a title from the saved session log using the same
+[tab-title generator](settings.md#tab-title) that names live sessions. It runs
+in a hidden utility runtime, started in the session's recorded project directory
+when that directory still exists (so project-local Explore agent and
+`agentModels` settings apply) and in the home directory otherwise. It follows
+`tabTitle.model` and `tabTitle.maxTitleLength`; `tabTitle.enabled` and
+`triggerAfter` only control automatic titling and do not disable the button.
+Settings and `models.json` are re-read from disk on every request, so changes
+saved in Dashboard Settings, the TUI, or by hand (including a model added to
+`models.json` and then pinned) apply to the next suggestion; if they cannot be
+re-read, the request fails rather than using stale settings. A pinned
+`tabTitle.model` that is not a known model is an error here, rather than a
+silent switch to another model.
+The suggestion only fills the input — nothing is saved until you confirm — and
+generating a title never modifies the session file. Failures (no model, an
+unknown pinned model, a provider error, an empty reply, the 60-second timeout,
+a session with no requests or activity to title, or an invalid session file)
+appear in the modal; closing the modal discards a pending suggestion.
+
+The server checks the path before touching anything: it must be an existing
+`.jsonl` regular file that starts with a session header. Anything else is
+rejected unchanged. If a dashboard runtime currently has the session open, the
+rename is sent to that runtime instead of being appended to the file, so the
+runtime's in-memory session stays consistent and its live card updates. A
+runtime that is still starting up on that session (a resume in progress) is
+waited for and then renamed the same way. The runtime is told which file the
+rename is for, so if it switches to a different session in the meantime the
+rename fails with an error asking you to try again, instead of renaming the
+other session. A dreb
+process outside this dashboard (such as a TUI) that has the same session open is
+not detected, the same as renaming from the TUI `/resume` picker: that process
+does not see the new name and can overwrite it if it later rewrites the file.
+
+Endpoints: `POST /api/sessions/rename` with `{ "path", "name" }` and
+`POST /api/sessions/title` with `{ "path" }` (returns `{ "title" }`); invalid
+paths and empty names return `400`. The title endpoint is backed by the
+[`generate_session_title`](rpc.md#generate_session_title) RPC command.
+
 ## Fleet transport and freshness
 
-A normal dashboard load makes one authoritative `GET /api/fleet`; the fleet is
-also included in the ordered `/api/resync` response only during exceptional
-recovery. After initial load, global event-derived `fleet_snapshot` SSE frames
-update live runtime cards. The runtime pool emits those frames with a 200 ms
-debounce from its in-memory state, so an update performs neither child RPC calls
-nor a disk inventory scan.
+A normal dashboard load is live-first: `GET /api/fleet/live` returns the live
+runtime cards without scanning historical session logs, the SSE connection opens,
+and `GET /api/sessions` fills the on-disk inventory in the background. This keeps
+live cards and reconnect status responsive even when the host has thousands of
+saved sessions. The combined `GET /api/fleet` remains available for diagnostics,
+and the fleet is included in the ordered `/api/resync` response only during
+exceptional recovery. After initial load, global event-derived `fleet_snapshot`
+SSE frames update live runtime cards. The runtime pool emits those frames with a
+200 ms debounce from its in-memory state, so an update performs neither child RPC
+calls nor a disk inventory scan.
 
 Live runtime state and on-disk session inventory have separate refresh paths.
-Before fleet, inventory, or resync serialization, the server explicitly projects
-each on-disk session to the declared browser DTO, includes server-validated
-historical-CWD availability and its canonical candidate, and bounds its
-first-message preview to 256 Unicode characters. Unavailable historical paths
-remain visible but do not enter operational project-root inventories. Internal
-parent paths and complete searchable transcript text never cross this browser
-boundary. After creating, resuming,
-stopping, or deleting a session, the client narrowly refreshes the disk list
-through `GET /api/sessions` rather than reloading the whole fleet. While the
+The server's lightweight session inventory caches projected metadata by session
+file mtime and size: each refresh stats the files, but rereads and parses only
+new or changed logs. Before fleet, inventory, or resync serialization, the server
+explicitly projects each on-disk session to the declared browser DTO, includes
+server-validated historical-CWD availability and its canonical candidate, and
+bounds its first-message preview to 256 Unicode characters. Unavailable historical
+paths remain visible but do not enter operational project-root inventories.
+Internal parent paths and complete searchable transcript text never cross this
+browser boundary. After creating, resuming, stopping, renaming, or deleting a session, the
+client narrowly refreshes the disk list through `GET /api/sessions` rather than
+reloading the whole fleet. Session files are written only with their first
+assistant reply, so the client also re-reads the disk list when a `fleet_snapshot`
+shows a live runtime idle with messages newer than the last inventory read and its
+session file still missing from inventory. Each such file triggers at most one
+read per newer message count (a pending read already counts), never while
+streaming and never before the initial inventory load; once indexed it never
+triggers again. While the
 Fleet screen or a session/subagent fleet sidebar is visible, it polls live-runtime
 stats on a shared 30-second cadence. That poll is single-flight, retains a
 card's last good stats if an update fails, and surfaces failures in the visible
@@ -357,8 +545,11 @@ authoritative initial-load or resync fleet preview is the fallback. `ctx%` is
 never estimated in the browser: it comes from authoritative session state or
 stats. Immediately after compaction, the session reports a conservative estimate
 over its rebuilt message context until fresh provider usage becomes available.
-Live card ordering remains deterministic by project path and then session start
-time, not mutable activity.
+Default Fleet ordering and all session/subagent fleet sidebars remain stable by
+effective project path, then runtime start time, not mutable activity. Fleet home
+honors its [explicitly selected sort](#fleet-sorting) on these existing updates;
+only selecting Last activity opts it into activity-driven reordering. Sorting
+adds no polling or network work and does not change this refresh cadence.
 
 A session drill-in hydrates through one `GET /api/runtimes/:key/hydrate` request.
 The server backs it with one `getDashboardSnapshot` RPC call and its matching
@@ -397,7 +588,11 @@ While the agent is streaming, the send button becomes mode-aware:
 - **steer** — deliver now: injected into the running turn after the current
   tool call completes.
 - **follow-up** — queued; delivered after the agent finishes the current work.
-- **■ stop** — abort the current turn. Only visible while streaming.
+- **■ stop** — abort the current turn. Visible whenever something can be
+  stopped: while the agent is streaming or compacting, and while any subagent is
+  still running (including when the parent is paused waiting on them). This also
+  stops all running subagents; to stop just one, use the ■ stop in its
+  [subagent view](#stopping-a-subagent).
 
 When the agent is idle, send is a plain prompt.
 
@@ -519,12 +714,53 @@ Background subagents are first-class:
   `background_agent_event` relay (see [RPC events](rpc.md#event-types)) and
   hydrates from the agent's on-disk session log on mount, so transcripts
   survive browser reloads and remain viewable after the agent finishes.
+- Each agent reports `running`, `completed`, `failed` (the child errored), or
+  `cancelled` (stopped by the user). The session panel marks cancelled agents
+  with `■` (failed ones keep `✕`) and the drill-in header chip reads
+  `cancelled`.
+
+### Stopping a subagent
+
+While a child is running — streaming, executing a tool, waiting for a
+concurrency slot, or between chain steps — the drill-in dock shows a
+**■ stop** button. It calls
+[`abort_background_agent`](rpc.md#abort_background_agent) for that one child:
+
+- Only that subagent stops. The parent session's run and queue, and every other
+  subagent (including its steering), keep running. The parent session's own
+  ■ stop (and Esc in the TUI) still stops everything.
+- The child is stopped gracefully: it aborts its own run first, so a hung tool
+  such as a long bash command is killed with its process group instead of being
+  orphaned, then it is terminated (SIGTERM, with a SIGKILL backstop). A child
+  stopped while it is still starting up is aborted as soon as its run begins,
+  before it can run any tool.
+- A queued child settles immediately without taking a concurrency slot. A chain
+  is stopped as a whole; no later step starts.
+- The parent receives a "cancelled by the user" notice in its context. Any
+  partial output sits between `--- agent output (partial) ---` and
+  `--- end of agent output ---` lines, apart from the notice's own lines. The
+  parent is **not** woken — nothing relaunches work you just
+  stopped. If the stopped agent was the last one running, the parent stays idle
+  until you prompt it. While the parent is busy (mid-run, retrying, or
+  compacting) the notice waits until it is idle again, so it never lands between
+  a tool call and its result. If you switch, start, or fork a session first, the
+  notice is still saved to the session it belongs to.
+- The stop is recorded in the agent's session directory, so it still shows as
+  cancelled after a reload or runtime restart. This includes a chain stopped
+  between steps, and an agent stopped while queued (which then has an empty
+  transcript).
+- Steering messages still queued in the stopped child are discarded with it.
+- While the stop is in flight the button reads `stopping…` and steering is
+  disabled; the view turns read-only when the cancellation arrives. A failed
+  stop request is shown in the view and the button re-enables for a retry.
 
 ## Responsive behavior
 
-Single breakpoint at 700px. At <=700px, fleet cards stack; long session names,
-status chips, project paths, activity and subagent text, and past-session
-labels wrap within their cards or rows rather than spilling off-screen. The
+Single breakpoint at 700px. At <=700px, fleet cards and past-session table rows
+stack; long session names, status chips, project paths, activity and subagent
+text, and past-session labels wrap within their cards or rows rather than
+spilling off-screen. The grouped table preserves accessible column headings;
+header sorting buttons remain keyboard-operable with 44px touch targets. The
 session view prioritizes read-and-steer (model/thinking switchers collapse into
 ⋯, and task/subagent panels default collapsed), and the file table shows name +
 download only. The session fleet sidebar becomes a fixed overlay drawer —
@@ -600,43 +836,147 @@ TUI theme system** — dashboard themes intentionally do not map to TUI themes.
   color vision. A separate mode toggle (system / light / dark) picks which
   variant renders; forced light/dark works for every theme, including
   entropist.ca. `system` follows the OS via `prefers-color-scheme`.
+- **User-message backgrounds.** User-message bubbles use the dashboard's
+  `--user-message-bg` color, with a distinct opaque fill for each theme's light
+  and dark palettes. The fill follows the selected theme and mode: forced
+  light/dark overrides the OS, while system mode responds to OS changes without
+  reloading. Normal user-message text meets WCAG AA contrast (at least 4.5:1)
+  on these fills. Only the text bubble is filled; attached images remain outside
+  it, and assistant and tool backgrounds are unchanged. There is no additional
+  preference or custom-color editor, and the terminal theme's `userMessageBg`
+  token does not control this dashboard color.
 - **Theme gallery and font selection.** The settings appearance section shows
   mode and font selectors plus a grid of live preview cards (one per theme).
   Each card previews its palette locally without touching the page until you
-  commit by clicking it. Theme default preserves each theme's built-in font;
-  IBM Plex Mono, JetBrains Mono, Fira Code (coding ligatures), Iosevka
-  (compact, coding ligatures), the bundled dyslexia-friendly OpenDyslexic, and
-  the low-vision-friendly Atkinson Hyperlegible can also be selected
-  independently. Explicit
-  choices are reflected in the previews, while Theme default previews stay on
-  IBM Plex Mono so the inactive Gruvbox card does not fetch JetBrains Mono.
+  commit by clicking it. The font picker offers **36 explicit choices plus
+  Theme default**: the six existing choices — IBM Plex Mono, JetBrains Mono,
+  Fira Code (coding ligatures), Iosevka (compact, coding ligatures), bundled
+  dyslexia-friendly OpenDyslexic, and low-vision-friendly Atkinson Hyperlegible —
+  plus 15 sans-serif and 15 serif families. Existing IDs and saved choices are
+  preserved; explicit choices override any theme and appear in theme-card
+  previews. Theme default preserves each theme's built-in font. Theme-card
+  previews stay on IBM Plex Mono for Theme default so an inactive Gruvbox card
+  does not fetch JetBrains Mono; the font picker's Theme default option instead
+  previews the **active** theme's built-in family, even if an explicit override
+  is currently selected.
+  Visible options preview their own regular face in the open listbox. The select-only
+  combobox supports Arrow Up/Down, Home/End, and typeahead to highlight options
+  without changing the saved choice; Enter/Space opens or commits, Escape
+  closes without committing, and Tab closes and moves focus without committing.
+  “Existing choices”, “Sans-serif fonts”, and “Serif fonts” are non-selectable
+  category headings, shown as uppercase, full-width dividers—not font options
+  or the smaller “Based on …” source descriptions.
+  Opening explicitly focuses the trigger. Background scrolling dismisses the
+  menu when its trigger leaves the viewport; internal catalog scrolling does not.
+  RFN-restricted additions have neutral primary option/trigger names and separate
+  “Based on …” descriptions naming the source (for example, Dreb Sans 07 / Based
+  on Lato). Typeahead also searches source families, and preference IDs are
+  unchanged. PT Serif uses Dreb Text 07 to avoid the reserved individual word Serif.
 - **Per-browser persistence.** Selections are stored in per-browser
   `localStorage` (`dreb.dashboard.theme`, `dreb.dashboard.colorMode`, and
   `dreb.dashboard.font`), with a cross-tab sync listener; a pristine install
-  (entropist.ca + system + Theme default font) leaves no keys behind and renders
-  byte-for-byte identically to the `tokens.css` baseline. No server/RPC
+  (entropist.ca + system + Theme default font) leaves no keys behind and matches
+  the current `tokens.css` baseline, including user-message fills. No server/RPC
   involvement, no runtime dependencies.
 - **No wrong-appearance flash.** A synchronous bootstrap in `index.html` paints
   the correct theme, mode, and explicit font before any CSS loads, and keeps a
   live `theme-color` meta in sync with the active background.
-- **Font loading.** Most themes default to Google-hosted IBM Plex Mono; Gruvbox
-  defaults to the bundled self-hosted JetBrains Mono (OFL, provenance in
-  `src/client/assets/fonts/`). Fira Code, Iosevka, the dyslexia-friendly
-  OpenDyslexic, and the low-vision-friendly Atkinson Hyperlegible are bundled
-  self-hosted explicit options (OFL, same directory, one provenance file each),
-  and any explicit font selection overrides the theme default. The self-hosted
-  families are lazy-loaded only
-  when active typography uses them — rendering a theme or its preview card
-  never fetches an alternate font. No `light-dark()` is used, keeping an iOS
-  Safari 16.4 floor.
+- **Font loading.** Existing Google-hosted IBM Plex Mono is unchanged; most
+  themes use it by default, while Gruvbox uses bundled self-hosted JetBrains
+  Mono. The existing five self-hosted families remain OFL-licensed with their
+  provenance in `packages/dashboard/src/client/assets/fonts/`. The 30 additions
+  are source-attributed Latin subsets with neutral internal names, all OFL-licensed; see
+  [`expanded/PROVENANCE.md`](../../dashboard/src/client/assets/fonts/expanded/PROVENANCE.md)
+  for sources, processing, checksums, and licenses.
+  Self-hosted faces load lazily when selected typography or open font-picker
+  previews use them. With the picker closed, alternate families are not used;
+  opening its listbox loads regular previews only as rows approach the visible
+  scroll window, not every family or unused bold/italic resource. Older browsers
+  without IntersectionObserver preview the complete open list. Every added
+  family has real regular, italic, bold, and bold-italic (400/700) support. Theme cards never introduce an alternate family beyond
+  the explicit selection. No font uploads or new multilingual bundles are
+  added; missing scripts use browser fallback.
+  New font source assets add **5,457,304 B** to the existing **1,395,464 B**, for
+  **6,852,768 B** combined. This source-asset total is not a startup download;
+  all new regular previews total **2,350,548 B**, downloaded progressively as
+  the list is explored. A local cold desktop fixture opened in about **14 ms**
+  and requested **109,412 B** of new fonts; closed startup requested none and
+  reopening reused loaded resources. Network/device speeds vary; the font
+  count is inexpensive DOM work (136 additional elements), while downloads
+  remain the main tradeoff. The same-toolchain production comparison adds
+  **4,737 B gzipped** across JavaScript and CSS; selected styles are fetched
+  on demand, and legal packaging does not duplicate source font binaries.
+  No `light-dark()` is used, keeping an iOS Safari 16.4 floor.
 - **PWA launch colors.** The static `manifest.webmanifest` keeps white
   (default-light) launch colors as the fallback; the live `theme-color` meta
   follows the active appearance once the app loads.
 
+### Custom fonts in a source build
+
+The released Dashboard supports its bundled catalog only. There is **no font
+upload control, custom-font install directory, settings-file font path, or
+runtime font discovery**. Uploading a font through the host Files screen does
+not register it with the appearance picker; installing it in your OS does not
+add a picker entry either. Font uploads are a separate feature, not a hidden
+configuration option.
+
+For a private customization, manually add the font to a **source checkout** and
+rebuild Dashboard. This is a developer workflow; npm upgrades do not preserve
+edits to an installed package:
+
+1. Put legally usable WOFF2 files and their license/provenance under
+   `packages/dashboard/src/client/assets/fonts/custom/`. Keep them separate from
+   `expanded/`, which is the hash-locked, generated catalog. Retain required
+   notices and obey Reserved Font Name rules if modifying a font. Supply genuine
+   normal/italic and weight faces for the styles you intend to use.
+2. Add a unique ID, label, CSS family, and existing `Sans-serif` or `Serif` group
+   to `packages/dashboard/src/client/state/font-catalog.ts`. For example:
+   ```ts
+   { id: "my-custom-font", label: "My Custom Font", family: "My Custom Font", group: "Sans-serif" },
+   ```
+   `appearance.ts` derives the valid IDs, picker entries and preview stack from
+   this registry. Keep restricted derivative names neutral, with secondary
+   source attribution using the registry's existing naming pattern.
+3. Create `packages/dashboard/src/client/styles/custom-fonts.css` with the real
+   faces and a scoped font override. For a regular-400 face:
+   ```css
+   @font-face {
+     font-family: "My Custom Font";
+     src: url("../assets/fonts/custom/my-custom-font-regular.woff2") format("woff2");
+     font-style: normal;
+     font-weight: 400;
+     font-display: swap;
+   }
+   [data-font="my-custom-font"] {
+     --mono-font: "My Custom Font", "IBM Plex Mono", "Courier New", monospace;
+   }
+   ```
+   Add corresponding rules for the other real faces. Link this stylesheet in
+   `packages/dashboard/src/client/index.html` **after** `font-catalog.css`; do
+   not append hand-written rules to the generated stylesheet.
+4. Add `my-custom-font` to the inline `FONTS` allowlist in that same HTML file so
+   saved selection restores synchronously. Update the catalog/count/group and
+   bootstrap test expectations for your private extra entry; retain the
+   existing checks for the managed `expanded/` records. If distributing your
+   build, include custom notices/provenance in Dashboard's `package.json`
+   `files` list as well as the built font resources.
+5. From the repository root, using the pinned Node 26 LTS toolchain, run `npm run check`, `npm run build`,
+   and `npm run verify-workspace-links`, then the Dashboard tests:
+   ```sh
+   npm run test --workspace @dreb/dashboard
+   node packages/dashboard/dist/index.js
+   ```
+   Use this built server, not an unchanged globally installed Dashboard. Check
+   selection, reload restoration, actual face loading and fallback behavior.
+
+There is no need to change server/RPC code for a private bundled font. A GUI
+upload feature would additionally need validation, storage, registration,
+persistence and licensing handling; it remains separate from this catalog.
+
 ## Limitations (deliberate, sequenced later)
 
 - No shell passthrough from the browser.
-- Completed, failed, rehydrated, and otherwise unavailable subagent transcripts are read-only; only a live controllable child accepts steering.
+- Completed, failed, cancelled, rehydrated, and otherwise unavailable subagent transcripts are read-only; only a live controllable child accepts steering, and only a running child can be stopped.
 
 ## Background service / auto-restart
 
@@ -660,7 +1000,12 @@ WantedBy=default.target
 ```
 
 Use the absolute path from `which dreb-dashboard` for `ExecStart` (the example
-matches an npm global prefix under `~/.npm-global`). Then:
+matches an npm global prefix under `~/.npm-global`). The `dreb-dashboard` bin
+starts with `#!/usr/bin/env node`, so it runs the first `node` on the service's
+`PATH` — under systemd that is usually the system Node, not one installed with
+a version manager such as nvm. Make sure it is Node 26 LTS, or set `ExecStart`
+to the absolute Node 26 binary followed by the resolved `dist/index.js`, as in
+the macOS example below. Then:
 
 ```bash
 systemctl --user daemon-reload
@@ -736,7 +1081,9 @@ realpath "$(command -v dreb-dashboard)"   # → /opt/homebrew/lib/node_modules/@
 
 Replace `/ABSOLUTE/PATH/TO/node` and `/ABSOLUTE/PATH/TO/@dreb/dashboard/dist/index.js`
 with the actual output. Also replace `/Users/YOU/` in the log paths with your
-home directory.
+home directory. If `node` comes from a version manager such as nvm, its path
+contains the Node version (e.g. `~/.nvm/versions/node/v26.13.0/bin/node`);
+update the plist whenever you switch Node versions. dreb requires Node 26 LTS.
 
 #### load / unload / status
 

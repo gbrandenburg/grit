@@ -5,16 +5,24 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
-import { type ImageContent, modelsAreEqual, supportsMax, supportsXhigh } from "@dreb/ai";
+import { clampThinkingLevel, type ImageContent, modelsAreEqual, supportsMax, supportsThinkingOff } from "@dreb/ai";
 import chalk from "chalk";
 import { createInterface } from "readline";
-import { type Args, parseArgs, printHelp } from "./cli/args.js";
+import { type Args, parseArgs, printHelp, validateRpcFullMessageUpdates } from "./cli/args.js";
 import { selectConfig } from "./cli/config-selector.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
 import { selectSession } from "./cli/session-picker.js";
-import { APP_NAME, CONFIG_DIR_NAME, getAgentDir, getModelsPath, loadProvidersEnv, VERSION } from "./config.js";
+import {
+	APP_NAME,
+	CONFIG_DIR_NAME,
+	getAgentDir,
+	getModelsPath,
+	loadProvidersEnv,
+	resolveConfiguredDirectory,
+	VERSION,
+} from "./config.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { LoadExtensionsResult } from "./core/extensions/index.js";
@@ -28,6 +36,7 @@ import { DefaultResourceLoader } from "./core/resource-loader.js";
 import { type CreateAgentSessionOptions, createAgentSession } from "./core/sdk.js";
 import { type SessionInfo, SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { unsupportedMaxError } from "./core/thinking.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { allTools } from "./core/tools/index.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
@@ -419,6 +428,22 @@ async function callSessionDirectoryHook(extensions: LoadExtensionsResult, cwd: s
 	return customSessionDir;
 }
 
+/** Resolve CLI > merged settings > extension-hook session directory precedence. */
+async function resolveEffectiveSessionDirectory(
+	parsed: Args,
+	settingsManager: SettingsManager,
+	extensions: LoadExtensionsResult,
+	cwd: string,
+): Promise<string | undefined> {
+	const cliDir = resolveConfiguredDirectory(parsed.sessionDir, cwd);
+	if (cliDir) return cliDir;
+
+	const settingsDir = resolveConfiguredDirectory(settingsManager.getSessionDir(), cwd);
+	if (settingsDir) return settingsDir;
+
+	return resolveConfiguredDirectory(await callSessionDirectoryHook(extensions, cwd), cwd);
+}
+
 function validateForkFlags(parsed: Args): void {
 	if (!parsed.fork) return;
 
@@ -451,13 +476,12 @@ async function createSessionManager(
 	extensions: LoadExtensionsResult,
 	settingsManager: SettingsManager,
 ): Promise<SessionManager | undefined> {
+	// Inventory keeps the same CLI > settings > extension precedence even when
+	// the active conversation itself is in-memory via --no-session.
+	const effectiveSessionDir = await resolveEffectiveSessionDirectory(parsed, settingsManager, extensions, cwd);
 	if (parsed.noSession) {
-		return SessionManager.inMemory();
+		return SessionManager.inMemory(cwd, effectiveSessionDir);
 	}
-
-	// Priority: CLI flag > settings.json > extension hook
-	const effectiveSessionDir =
-		parsed.sessionDir ?? settingsManager.getSessionDir() ?? (await callSessionDirectoryHook(extensions, cwd));
 
 	if (parsed.fork) {
 		const resolved = await resolveSessionPath(parsed.fork, cwd, effectiveSessionDir);
@@ -809,6 +833,12 @@ export async function main(args: string[]) {
 	migrateKeybindingsConfigFile(agentDir);
 	time("migrateKeybindingsConfigFile");
 
+	const rpcFullMessageUpdatesError = validateRpcFullMessageUpdates(parsed);
+	if (rpcFullMessageUpdatesError) {
+		log.error(chalk.red(`Error: ${rpcFullMessageUpdatesError}`));
+		process.exit(1);
+	}
+
 	if (parsed.mode === "rpc" && parsed.fileArgs.length > 0) {
 		log.error(chalk.red("Error: @file arguments are not supported in RPC mode"));
 		process.exit(1);
@@ -869,10 +899,12 @@ export async function main(args: string[]) {
 	// Handle --resume: show session picker
 	if (parsed.resume) {
 		// Compute effective session dir for resume (same logic as createSessionManager)
-		const effectiveSessionDir =
-			parsed.sessionDir ??
-			settingsManager.getSessionDir() ??
-			(await callSessionDirectoryHook(extensionsResult, cwd));
+		const effectiveSessionDir = await resolveEffectiveSessionDirectory(
+			parsed,
+			settingsManager,
+			extensionsResult,
+			cwd,
+		);
 
 		const selectedPath = await selectSession(
 			(onProgress) => SessionManager.list(cwd, effectiveSessionDir, onProgress),
@@ -936,19 +968,17 @@ export async function main(args: string[]) {
 	if (session.model && cliThinkingOverride) {
 		const requestedThinking = parsed.thinking ?? sessionOptions.thinkingLevel;
 		if (requestedThinking === "max" && !supportsMax(session.model)) {
-			log.error(
-				chalk.red(
-					`Thinking level "max" is not supported by model "${session.model.provider}/${session.model.id}". Use "xhigh" or choose a max-capable model.`,
-				),
-			);
+			log.error(chalk.red(unsupportedMaxError(session.model)));
 			process.exit(1);
 		}
-		let effectiveThinking = session.thinkingLevel;
-		if (!session.model.reasoning) {
-			effectiveThinking = "off";
-		} else if (effectiveThinking === "xhigh" && !supportsXhigh(session.model)) {
-			effectiveThinking = "high";
+		if (requestedThinking === "off" && session.model.reasoning && !supportsThinkingOff(session.model)) {
+			log.warn(
+				chalk.yellow(
+					`Warning: Thinking cannot be turned off for model "${session.model.provider}/${session.model.id}". Using "minimal" instead.`,
+				),
+			);
 		}
+		const effectiveThinking = clampThinkingLevel(session.model, session.thinkingLevel);
 		if (effectiveThinking !== session.thinkingLevel) {
 			session.setThinkingLevel(effectiveThinking);
 		}
@@ -956,7 +986,7 @@ export async function main(args: string[]) {
 
 	if (mode === "rpc") {
 		printTimings();
-		await runRpcMode(session, modelFallbackMessage);
+		await runRpcMode(session, modelFallbackMessage, { fullMessageUpdates: parsed.rpcFullMessageUpdates });
 	} else if (isInteractive) {
 		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
 			const modelList = scopedModels

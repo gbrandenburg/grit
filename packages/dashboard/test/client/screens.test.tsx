@@ -61,6 +61,7 @@ vi.mock("../../src/client/api.js", () => ({
 			pending: { steering: [], followUp: [] },
 		})),
 		steerSubagent: vi.fn(async () => ({ ok: true })),
+		abortSubagent: vi.fn(async () => ({ ok: true })),
 		models: vi.fn(async () => ({ models: [] })),
 		settingsModels: vi.fn(async () => ({ models: [] })),
 		agentTypes: vi.fn(async () => ({ agentTypes: [] })),
@@ -86,7 +87,7 @@ vi.mock("../../src/client/api.js", () => ({
 		branch: vi.fn(async () => ({ branch: null })),
 		forkMessages: vi.fn(async () => ({ messages: [] })),
 		fork: vi.fn(async () => ({ text: "", cancelled: false })),
-		dailyCost: vi.fn(async () => ({ cost: 0.42 })),
+		dailyCost: vi.fn(async () => ({ cost: 0.42, main: 0.42, subagent: 0 })),
 		settings: vi.fn(async () => ({ defaultProvider: "anthropic", defaultModel: "m1" })),
 		devices: vi.fn(async () => ({ devices: [] })),
 		unpair: vi.fn(async () => ({ ok: true })),
@@ -235,6 +236,8 @@ vi.mock("../../src/client/api.js", () => ({
 		resume: vi.fn(async () => ({ cancelled: false })),
 		saveSettings: vi.fn(async (settings) => settings),
 		deleteSession: vi.fn(async () => ({ ok: true })),
+		renameDiskSession: vi.fn(async (_path: string, name: string) => ({ name })),
+		generateSessionTitle: vi.fn(async () => ({ title: "Generated title" })),
 		stopRuntime: vi.fn(async () => ({ ok: true })),
 		createRuntime: vi.fn(async (cwd: string) => ({
 			key: "new-key",
@@ -284,13 +287,19 @@ import {
 	__resetAppearanceForTests,
 	COLOR_MODE_STORAGE_KEY,
 	FONT_STORAGE_KEY,
+	FONTS,
+	type FontId,
 	reloadAppearance,
 	THEME_STORAGE_KEY,
 } from "../../src/client/state/appearance.js";
 import { evictComposerMemory, getComposerDraft } from "../../src/client/state/composer-memory.js";
+import { DEFAULT_FLEET_SORT, FLEET_SORT_OPTIONS, type FleetSortKey } from "../../src/client/state/fleet-sorting.js";
 import {
+	FLEET_SORT_KEY,
+	reloadFleetSortPreference,
 	SESSION_SIDEBAR_COLLAPSED_KEY,
 	setExpandThinking,
+	setFleetSort,
 	setImageDisplayMode,
 	setSessionSidebarCollapsed,
 } from "../../src/client/state/preferences.js";
@@ -305,10 +314,12 @@ import {
 import { createAppStore } from "../../src/client/state/store.js";
 import {
 	type CommandDto,
+	type FleetDto,
 	MAX_TOTAL_IMAGE_BYTES,
 	type PerformanceModelSummaryDto,
 	type PerformanceStatsDto,
 	type RuntimeInfoDto,
+	type SessionInfoDto,
 	type SettingsDto,
 } from "../../src/shared/protocol.js";
 
@@ -381,6 +392,7 @@ beforeEach(() => {
 			},
 		},
 	});
+	reloadFleetSortPreference();
 });
 
 afterEach(() => {
@@ -391,6 +403,7 @@ afterEach(() => {
 	setExpandThinking(false);
 	setImageDisplayMode("previews");
 	setSessionSidebarCollapsed(false);
+	setFleetSort(DEFAULT_FLEET_SORT);
 	window.localStorage.clear();
 	vi.mocked(connectEvents).mockImplementation(() => () => {});
 	vi.mocked(api.auth).mockResolvedValue({ mode: "local", needsPairing: false });
@@ -450,7 +463,11 @@ afterEach(() => {
 	vi.mocked(api.agentTypes).mockResolvedValue({ agentTypes: [] });
 	vi.mocked(api.settings).mockResolvedValue({ defaultProvider: "anthropic", defaultModel: "m1" });
 	vi.mocked(api.saveSettings).mockImplementation(async (settings) => settings);
-	vi.mocked(api.deleteSession).mockResolvedValue({ ok: true });
+	vi.mocked(api.deleteSession).mockReset().mockResolvedValue({ ok: true });
+	vi.mocked(api.renameDiskSession)
+		.mockReset()
+		.mockImplementation(async (_path: string, name: string) => ({ name }));
+	vi.mocked(api.generateSessionTitle).mockReset().mockResolvedValue({ title: "Generated title" });
 	vi.mocked(api.stopRuntime).mockResolvedValue({ ok: true });
 	vi.mocked(api.createRuntime).mockImplementation(async (cwd: string) => ({
 		key: "new-key",
@@ -506,7 +523,7 @@ afterEach(() => {
 	vi.mocked(api.dequeue).mockResolvedValue({ steering: [], followUp: [] });
 	vi.mocked(api.forkMessages).mockResolvedValue({ messages: [] });
 	vi.mocked(api.fork).mockResolvedValue({ text: "", cancelled: false });
-	vi.mocked(api.dailyCost).mockResolvedValue({ cost: 0.42 });
+	vi.mocked(api.dailyCost).mockResolvedValue({ cost: 0.42, main: 0.42, subagent: 0 });
 	vi.unstubAllGlobals();
 	Reflect.deleteProperty(window, "matchMedia");
 	vi.mocked(api.places).mockResolvedValue({ places: [{ label: "home", path: "/home/test" }] });
@@ -2158,7 +2175,7 @@ describe("screen smoke tests", () => {
 
 	it("session view renders with a populated transcript and session info bar", async () => {
 		vi.mocked(api.branch).mockResolvedValue({ branch: "feature/info" });
-		vi.mocked(api.dailyCost).mockResolvedValue({ cost: 1.25 });
+		vi.mocked(api.dailyCost).mockResolvedValue({ cost: 1.25, main: 1.0, subagent: 0.25 });
 		vi.mocked(api.performance).mockResolvedValue({
 			models: [
 				performanceSummary({ rolling: { count: 4 }, delta: { baselineCount: 4, recentCount: 4 } }),
@@ -2220,6 +2237,58 @@ describe("screen smoke tests", () => {
 		expect(el.textContent).toContain("scan things");
 		// Suggest-next chip
 		expect(el.textContent).toContain("/skill:test");
+	});
+
+	it("shows sub-agent cost when the parent session cost is zero", async () => {
+		vi.mocked(api.stats).mockResolvedValue({
+			sessionId: "s1",
+			userMessages: 0,
+			assistantMessages: 0,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 0,
+			tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			cost: 0,
+			subagentCost: 0.75,
+		});
+		vi.mocked(api.dailyCost).mockResolvedValue({ cost: 0.75, main: 0, subagent: 0.75 });
+		const store = makeStore() as any;
+		const session = populatedSession("zero-parent-cost");
+		const fakeStore = {
+			...store,
+			sessions: { "zero-parent-cost": session },
+			fleet: () => ({
+				runtimes: [
+					{
+						key: "zero-parent-cost",
+						cwd: "/home/test/project",
+						state: {
+							sessionId: "s1",
+							thinkingLevel: "off",
+							isStreaming: false,
+							isCompacting: false,
+							steeringMode: "all",
+							followUpMode: "all",
+							autoCompactionEnabled: true,
+							messageCount: 0,
+							pendingMessageCount: 0,
+							usingSubscription: false,
+						},
+						backgroundAgents: [],
+						needsAttention: false,
+						createdAt: new Date().toISOString(),
+						lastActivity: new Date().toISOString(),
+					},
+				],
+				diskSessions: [],
+			}),
+			hydrateSession: async () => {},
+		};
+
+		const el = mount(() => <SessionScreen store={fakeStore} sessionKey="zero-parent-cost" />);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		expect(el.textContent).toContain("$0.000 + $0.750 subs");
 	});
 
 	it("keeps mounted header details live and refreshes context when compaction ends", async () => {
@@ -3336,6 +3405,189 @@ describe("screen smoke tests", () => {
 
 		(chips[0] as HTMLButtonElement).click();
 		expect(navigate).toHaveBeenCalledWith({ screen: "subagent", key: "k-submany", agentId: "bg6" });
+	});
+
+	/** A session whose `bg-live` child is running (and not streaming) plus a fake store around it. */
+	function liveSubagentStore(key: string) {
+		const store = makeStore() as any;
+		const session = populatedSession(key);
+		applySessionEvent(session, {
+			type: "background_agent_start",
+			agentId: "bg-live",
+			agentType: "Explore",
+			taskSummary: "scan things",
+		});
+		return {
+			session,
+			fakeStore: { ...store, sessions: { [key]: session }, fleet: () => ({ runtimes: [], diskSessions: [] }) },
+		};
+	}
+
+	function subagentStopButton(el: HTMLElement): HTMLButtonElement | undefined {
+		return [...el.querySelectorAll(".dock .status-line button")].find((button) =>
+			/■ stop|stopping…/.test(button.textContent ?? ""),
+		) as HTMLButtonElement | undefined;
+	}
+
+	it("subagent drill-in shows ■ stop for a running child even when it is not streaming", async () => {
+		const { session, fakeStore } = liveSubagentStore("k-stop-visible");
+		expect(session.subagents["bg-live"]?.streaming).toBeFalsy();
+		const el = mount(() => <SubagentScreen store={fakeStore} sessionKey="k-stop-visible" agentId="bg-live" />);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		const stop = subagentStopButton(el);
+		expect(stop).toBeDefined();
+		expect(stop?.textContent).toBe("■ stop");
+		// Same style as the session view's controls-dock stop.
+		expect(stop?.className).toContain("btn-small");
+		expect(stop?.className).toContain("btn-danger");
+		expect(el.textContent).not.toContain("● working");
+	});
+
+	it("subagent drill-in shows ■ stop alongside ● working while the child is streaming", async () => {
+		const { session, fakeStore } = liveSubagentStore("k-stop-streaming");
+		applySessionEvent(session, {
+			type: "background_agent_event",
+			agentId: "bg-live",
+			event: { type: "agent_start" },
+		});
+		expect(session.subagents["bg-live"]?.streaming).toBe(true);
+		vi.mocked(api.abortSubagent).mockClear();
+		const el = mount(() => <SubagentScreen store={fakeStore} sessionKey="k-stop-streaming" agentId="bg-live" />);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(el.querySelector(".dock .status-line .working")?.textContent).toBe("● working");
+		const stop = subagentStopButton(el);
+		expect(stop?.textContent).toBe("■ stop");
+		expect(stop?.disabled).toBe(false);
+		stop!.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(api.abortSubagent).toHaveBeenCalledWith("k-stop-streaming", "bg-live");
+	});
+
+	it("subagent ■ stop stops only that child and locks steering while the stop is in flight", async () => {
+		const { fakeStore } = liveSubagentStore("k-stop-one");
+		vi.mocked(api.abortSubagent).mockClear();
+		vi.mocked(api.abort).mockClear();
+		const el = mount(() => <SubagentScreen store={fakeStore} sessionKey="k-stop-one" agentId="bg-live" />);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		subagentStopButton(el)!.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(api.abortSubagent).toHaveBeenCalledTimes(1);
+		expect(api.abortSubagent).toHaveBeenCalledWith("k-stop-one", "bg-live");
+		expect(api.abort).not.toHaveBeenCalled();
+		const stop = subagentStopButton(el)!;
+		expect(stop.textContent).toBe("stopping…");
+		expect(stop.disabled).toBe(true);
+		expect((el.querySelector("textarea") as HTMLTextAreaElement).disabled).toBe(true);
+		expect((el.querySelector("button.send") as HTMLButtonElement).disabled).toBe(true);
+
+		// A second click while stopping does not issue another request.
+		stop.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(api.abortSubagent).toHaveBeenCalledTimes(1);
+	});
+
+	it("subagent stop failures stay visible and the button re-enables for a retry", async () => {
+		const { fakeStore } = liveSubagentStore("k-stop-fail");
+		vi.mocked(api.abortSubagent).mockClear();
+		vi.mocked(api.abortSubagent).mockRejectedValueOnce(new Error("runtime unreachable"));
+		const el = mount(() => <SubagentScreen store={fakeStore} sessionKey="k-stop-fail" agentId="bg-live" />);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		subagentStopButton(el)!.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(el.querySelector(".pair-error")?.textContent).toContain("runtime unreachable");
+		const stop = subagentStopButton(el)!;
+		expect(stop.textContent).toBe("■ stop");
+		expect(stop.disabled).toBe(false);
+		expect((el.querySelector("textarea") as HTMLTextAreaElement).disabled).toBe(false);
+
+		stop.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(api.abortSubagent).toHaveBeenCalledTimes(2);
+		expect(el.querySelector(".pair-error")).toBeNull();
+	});
+
+	it("subagent ■ stop is hidden for completed, failed, cancelled, and closed children", () => {
+		const cases: Array<{ key: string; end?: Record<string, unknown>; closed?: boolean; note: string }> = [
+			{ key: "k-done", end: { success: true, cancelled: false }, note: "no longer running" },
+			{ key: "k-failed", end: { success: false, cancelled: false }, note: "no longer running" },
+			{ key: "k-cancelled", end: { success: false, cancelled: true }, note: "This subagent was stopped" },
+			{ key: "k-closed", closed: true, note: "This session is closed" },
+		];
+		for (const testCase of cases) {
+			const { session, fakeStore } = liveSubagentStore(testCase.key);
+			if (testCase.end) {
+				applySessionEvent(session, {
+					type: "background_agent_end",
+					agentId: "bg-live",
+					agentType: "Explore",
+					...testCase.end,
+				});
+			}
+			if (testCase.closed) session.closed = { cwd: "/repo", sessionFile: "/sessions/closed.jsonl" };
+			const el = mount(() => <SubagentScreen store={fakeStore} sessionKey={testCase.key} agentId="bg-live" />);
+			expect(subagentStopButton(el), testCase.key).toBeUndefined();
+			expect(el.textContent, testCase.key).toContain(testCase.note);
+		}
+	});
+
+	it("a cancelled subagent shows a cancelled status chip, not an error", () => {
+		const { session, fakeStore } = liveSubagentStore("k-cancel-chip");
+		applySessionEvent(session, {
+			type: "background_agent_end",
+			agentId: "bg-live",
+			agentType: "Explore",
+			success: false,
+			cancelled: true,
+		});
+		const el = mount(() => <SubagentScreen store={fakeStore} sessionKey="k-cancel-chip" agentId="bg-live" />);
+		const chip = el.querySelector(".session-header-actions .chip");
+		expect(chip?.textContent).toContain("cancelled");
+		expect(chip?.className).toContain("chip-idle");
+		expect(chip?.className).not.toContain("chip-error");
+	});
+
+	it("the session subagent panel marks cancelled agents distinctly from failed ones", () => {
+		const store = makeStore() as any;
+		const session = createSessionViewState("k-panel-cancel");
+		for (const agentId of ["bg-failed", "bg-cancelled"]) {
+			applySessionEvent(session, {
+				type: "background_agent_start",
+				agentId,
+				agentType: "Explore",
+				taskSummary: agentId,
+			});
+		}
+		applySessionEvent(session, {
+			type: "background_agent_end",
+			agentId: "bg-failed",
+			success: false,
+			cancelled: false,
+		});
+		applySessionEvent(session, {
+			type: "background_agent_end",
+			agentId: "bg-cancelled",
+			success: false,
+			cancelled: true,
+		});
+		const fakeStore = {
+			...store,
+			sessions: { "k-panel-cancel": session },
+			fleet: () => ({ runtimes: [], diskSessions: [] }),
+			hydrateSession: async () => {},
+		};
+		const el = mount(() => <SessionScreen store={fakeStore} sessionKey="k-panel-cancel" />);
+		const chips = [...el.querySelectorAll(".subagent-list .agent-chip")];
+		const glyphFor = (agentId: string) =>
+			chips.find((chip) => chip.textContent?.includes(agentId))?.querySelector("span")?.textContent;
+		expect(glyphFor("bg-failed")).toBe("✕");
+		expect(glyphFor("bg-cancelled")).toBe("■");
+		expect(el.textContent).toContain("subagents — 0 running · 2 done");
 	});
 
 	it("subagent drill-in renders completed transcripts read-only", () => {
@@ -5562,6 +5814,27 @@ describe("dashboard client regressions", () => {
 			reloadAppearance(); // re-reads (now-empty) storage → removes the <html> attrs
 		}
 
+		function fontTrigger(el: HTMLElement): HTMLButtonElement {
+			return el.querySelector<HTMLButtonElement>('#pref-font[role="combobox"]')!;
+		}
+
+		function currentFont(el: HTMLElement): string | null {
+			return fontTrigger(el).getAttribute("data-font-value");
+		}
+
+		function openFontPicker(el: HTMLElement): HTMLElement {
+			const trigger = fontTrigger(el);
+			if (trigger.getAttribute("aria-expanded") !== "true") trigger.click();
+			return el.querySelector<HTMLElement>('[role="listbox"][aria-label="font choices"]')!;
+		}
+
+		function selectFont(el: HTMLElement, id: FontId): void {
+			const popup = openFontPicker(el);
+			popup.querySelector<HTMLButtonElement>(`[data-font-option="${id}"]`)!.click();
+			expect(currentFont(el)).toBe(id);
+			expect(fontTrigger(el).getAttribute("aria-expanded")).toBe("false");
+		}
+
 		beforeEach(resetAppearance);
 		afterEach(resetAppearance);
 
@@ -5575,16 +5848,13 @@ describe("dashboard client regressions", () => {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 
 			expect(el.querySelector("#pref-color-mode")).not.toBeNull();
-			const fontSelect = el.querySelector("#pref-font") as HTMLSelectElement;
-			expect(Array.from(fontSelect.options).map((option) => [option.value, option.textContent])).toEqual([
-				["theme", "Theme default"],
-				["ibm-plex-mono", "IBM Plex Mono"],
-				["jetbrains-mono", "JetBrains Mono"],
-				["fira-code", "Fira Code"],
-				["iosevka", "Iosevka"],
-				["opendyslexic", "OpenDyslexic"],
-				["atkinson-hyperlegible", "Atkinson Hyperlegible"],
-			]);
+			expect(fontTrigger(el).getAttribute("aria-label")).toBe("font");
+			const popup = openFontPicker(el);
+			const options = Array.from(popup.querySelectorAll('[role="option"][data-font-option]'));
+			expect(options).toHaveLength(37);
+			expect(
+				options.map((option) => [option.getAttribute("data-font-option"), option.getAttribute("aria-label")]),
+			).toEqual(FONTS.map(({ id, label }) => [id, label]));
 			expect(el.querySelectorAll("[data-theme-card]").length).toBe(8);
 			expect(el.querySelector('[data-theme-card="default"]')).not.toBeNull();
 			expect(el.querySelector('[data-theme-card="gruvbox"]')).not.toBeNull();
@@ -5623,8 +5893,7 @@ describe("dashboard client regressions", () => {
 			expect(card.getAttribute("aria-pressed")).toBe("true");
 			const select = el.querySelector("#pref-color-mode") as HTMLSelectElement;
 			expect(select.value).toBe("dark");
-			const fontSelect = el.querySelector("#pref-font") as HTMLSelectElement;
-			expect(fontSelect.value).toBe("opendyslexic");
+			expect(currentFont(el)).toBe("opendyslexic");
 			expect(document.documentElement.getAttribute("data-font")).toBe("opendyslexic");
 		});
 
@@ -5678,14 +5947,11 @@ describe("dashboard client regressions", () => {
 			const el = mount(() => <SettingsScreen store={store} />);
 			await new Promise((resolve) => setTimeout(resolve, 10));
 
-			const fontSelect = el.querySelector("#pref-font") as HTMLSelectElement;
-			fontSelect.value = "opendyslexic";
-			fontSelect.dispatchEvent(new Event("change", { bubbles: true }));
+			selectFont(el, "opendyslexic");
 			expect(document.documentElement.getAttribute("data-font")).toBe("opendyslexic");
 			expect(window.localStorage.getItem(FONT_STORAGE_KEY)).toBe("opendyslexic");
 
-			fontSelect.value = "jetbrains-mono";
-			fontSelect.dispatchEvent(new Event("change", { bubbles: true }));
+			selectFont(el, "jetbrains-mono");
 			expect(document.documentElement.getAttribute("data-font")).toBe("jetbrains-mono");
 			expect(window.localStorage.getItem(FONT_STORAGE_KEY)).toBe("jetbrains-mono");
 
@@ -5694,8 +5960,7 @@ describe("dashboard client regressions", () => {
 			expect(document.documentElement.getAttribute("data-theme")).toBe("gruvbox");
 			expect(document.documentElement.getAttribute("data-font")).toBe("jetbrains-mono");
 
-			fontSelect.value = "theme";
-			fontSelect.dispatchEvent(new Event("change", { bubbles: true }));
+			selectFont(el, "theme");
 			expect(document.documentElement.getAttribute("data-font")).toBeNull();
 			expect(window.localStorage.getItem(FONT_STORAGE_KEY)).toBeNull();
 		});
@@ -5757,17 +6022,13 @@ describe("dashboard client regressions", () => {
 			const cards = Array.from(el.querySelectorAll("[data-theme-card]"));
 			for (const card of cards) expect(card.getAttribute("data-font")).toBe("ibm-plex-mono");
 
-			const fontSelect = el.querySelector("#pref-font") as HTMLSelectElement;
-			fontSelect.value = "jetbrains-mono";
-			fontSelect.dispatchEvent(new Event("change", { bubbles: true }));
+			selectFont(el, "jetbrains-mono");
 			for (const card of cards) expect(card.getAttribute("data-font")).toBe("jetbrains-mono");
 
-			fontSelect.value = "opendyslexic";
-			fontSelect.dispatchEvent(new Event("change", { bubbles: true }));
+			selectFont(el, "opendyslexic");
 			for (const card of cards) expect(card.getAttribute("data-font")).toBe("opendyslexic");
 
-			fontSelect.value = "ibm-plex-mono";
-			fontSelect.dispatchEvent(new Event("change", { bubbles: true }));
+			selectFont(el, "ibm-plex-mono");
 			for (const card of cards) expect(card.getAttribute("data-font")).toBe("ibm-plex-mono");
 		});
 
@@ -6675,6 +6936,850 @@ describe("dashboard client regressions", () => {
 		expect(vi.mocked(api.listFiles).mock.calls.some(([target]) => target === "/")).toBe(false);
 	});
 
+	describe("Fleet sort controls", () => {
+		const date = (day: number) => `2026-01-${String(day).padStart(2, "0")}T00:00:00.000Z`;
+		const disk = (id: string, cwd: string, modified: number): SessionInfoDto => ({
+			id,
+			path: `/sessions/${id}.jsonl`,
+			cwd,
+			name: id,
+			created: date(modified),
+			modified: date(modified),
+			messageCount: 1,
+			firstMessage: id,
+		});
+		const names = (el: HTMLElement) => [...el.querySelectorAll(".session-card .name")].map((n) => n.textContent);
+		const header = (el: ParentNode, key: Exclude<FleetSortKey, "default">) =>
+			el.querySelector<HTMLButtonElement>(`.fleet-sort-header[data-sort-key="${key}"]`)!;
+		const diskNames = (el: ParentNode) => [...el.querySelectorAll(".disk-row .name")].map((n) => n.textContent);
+		function fixture(runtimes: RuntimeInfoDto[], diskSessions: SessionInfoDto[] = []) {
+			const [fleet, setFleet] = createSignal<FleetDto>({ runtimes, diskSessions });
+			const store = {
+				...makeStore(),
+				fleet,
+				navigate: vi.fn(),
+				upsertRuntime: vi.fn(),
+				refreshDiskSessions: vi.fn(async () => {}),
+			};
+			const { container: el, dispose } = mountDisposable(() => <FleetScreen store={store} />);
+			disposers.push(dispose);
+			return { el, store, setFleet, dispose };
+		}
+
+		describe("Fleet metadata filters", () => {
+			function search(el: HTMLElement, query: string): HTMLInputElement {
+				const input = el.querySelector<HTMLInputElement>("#fleet-search")!;
+				input.value = query;
+				input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+				return input;
+			}
+			const attention = (el: HTMLElement) => el.querySelectorAll<HTMLButtonElement>(".fleet-count-filter")[1];
+			const clear = (el: HTMLElement) => el.querySelector<HTMLButtonElement>(".fleet-clear-filters")!;
+
+			it("keeps total counts, live attention scope and displayed result counts distinct without requesting data", () => {
+				const a = { ...runtimeInfo("Alpha", "/live/a"), needsAttention: true };
+				const b = runtimeInfo("Beta", "/live/b");
+				b.state.sessionFile = "/sessions/Beta.jsonl";
+				const { el } = fixture([b, a], [disk("Beta", "/old/b", 2), disk("Past", "/past", 1)]);
+				const requests = [api.sessions, api.fleet, api.hydrate, api.stats, api.runtime];
+				for (const request of requests) vi.mocked(request).mockClear();
+				expect(el.querySelector("label[for='fleet-search']")?.textContent).toBe("Search sessions");
+				expect(el.querySelector<HTMLInputElement>("#fleet-search")?.type).toBe("search");
+				expect(clear(el).disabled).toBe(true);
+				attention(el).click();
+				expect(names(el)).toEqual(["Alpha"]);
+				expect(diskNames(el)).toEqual(["Past"]);
+				expect(attention(el).getAttribute("aria-pressed")).toBe("true");
+				search(el, " beta ");
+				expect(names(el)).toEqual([]);
+				expect(diskNames(el)).toEqual([]); // matching live file never becomes history
+				expect(el.querySelector(".fleet-counts")?.textContent).toContain("2 live");
+				expect(el.querySelector(".fleet-counts")?.textContent).toContain("1 needs attention");
+				expect(el.querySelector(".fleet-counts")?.textContent).toContain("2 on disk");
+				expect(el.querySelector(".fleet-filter-results")?.textContent).toContain("live sessions only");
+				expect(el.querySelector(".fleet-filter-results")?.textContent).toContain("0 matching live sessions");
+				expect(el.querySelector(".fleet-filter-results")?.getAttribute("aria-live")).toBe("polite");
+				expect(el.textContent).not.toContain("No sessions yet.");
+				clear(el).click();
+				expect(names(el)).toEqual(["Alpha", "Beta"]);
+				expect(diskNames(el)).toEqual(["Past"]);
+				for (const request of requests) expect(request).not.toHaveBeenCalled();
+			});
+
+			it("filters complete groups before preview and reranks groups using their matching leading member", () => {
+				const entries = [
+					disk("unrelated newest", "/a", 20),
+					disk("unrelated second", "/a", 19),
+					disk("unrelated third", "/a", 18),
+					disk("Needle one", "/a", 1),
+					disk("Needle two", "/b", 10),
+				];
+				const { el } = fixture([], entries);
+				expect(diskNames(el)).not.toContain("Needle one");
+				search(el, " NEEDLE ");
+				expect(diskNames(el)).toEqual(["Needle two", "Needle one"]);
+				expect([...el.querySelectorAll(".group-head h3")].map((e) => e.textContent)).toEqual(["/b", "/a"]);
+				expect(el.querySelector(".fleet-filter-results")?.textContent).toContain("2 matching past sessions");
+				search(el, "/a");
+				expect(diskNames(el)).toEqual(["unrelated newest", "unrelated second", "unrelated third"]);
+				expect(el.querySelector(".disk-more")?.textContent).toContain("all 4 matches");
+				el.querySelector<HTMLButtonElement>(".disk-more")!.click();
+				expect(diskNames(el)).toHaveLength(4);
+				search(el, "Needle two");
+				clear(el).click();
+				expect(el.querySelector(".disk-more")?.textContent).toContain("show fewer");
+				expect(diskNames(el)).toHaveLength(5);
+			});
+
+			it("keeps filter clearing separate from sorting and resets only screen-local state on remount", () => {
+				const a = { ...runtimeInfo("Alpha", "/a"), needsAttention: true };
+				const b = runtimeInfo("Beta", "/b");
+				const { el, dispose } = fixture([a, b], [disk("Past", "/past", 1)]);
+				header(el, "name").click();
+				header(el, "name").click();
+				search(el, "Alpha");
+				attention(el).click();
+				el.querySelector<HTMLButtonElement>(".fleet-sort-reset")!.click();
+				expect(el.querySelector<HTMLInputElement>("#fleet-search")!.value).toBe("Alpha");
+				expect(attention(el).getAttribute("aria-pressed")).toBe("true");
+				header(el, "name").click();
+				header(el, "name").click();
+				clear(el).click();
+				expect(names(el)).toEqual(["Beta", "Alpha"]);
+				expect(header(el, "name").dataset.sortDirection).toBe("desc");
+				search(el, "Alpha");
+				attention(el).click();
+				dispose();
+				el.remove();
+				const remounted = fixture([a, b]).el;
+				expect(names(remounted)).toEqual(["Beta", "Alpha"]);
+				expect(remounted.querySelector<HTMLInputElement>("#fleet-search")!.value).toBe("");
+				expect(attention(remounted).getAttribute("aria-pressed")).toBe("false");
+				expect(header(remounted, "name").dataset.sortDirection).toBe("desc");
+			});
+
+			it("applies a pending search to late inventory and live-attention updates without moving input focus", async () => {
+				const a = runtimeInfo("Needle live", "/live");
+				a.state.sessionName = "Needle live";
+				const { el, setFleet } = fixture([a]);
+				const input = search(el, "needle");
+				input.focus();
+				attention(el).click(); // programmatic click does not deliberately move keyboard focus
+				expect(names(el)).toEqual([]);
+				setFleet({
+					runtimes: [{ ...a, needsAttention: true }],
+					diskSessions: [disk("Other", "/other", 2), disk("Needle saved", "/past", 1)],
+				});
+				await Promise.resolve();
+				expect(document.activeElement).toBe(input);
+				expect(names(el)).toEqual(["Needle live"]);
+				expect(diskNames(el)).toEqual(["Needle saved"]);
+				expect(input.value).toBe("needle");
+				setFleet({ runtimes: [{ ...a, needsAttention: false }], diskSessions: [] });
+				expect(names(el)).toEqual([]);
+				expect(attention(el).getAttribute("aria-pressed")).toBe("true");
+				expect(attention(el).textContent).toBe("0 needs attention");
+				expect(attention(el).disabled).toBe(false);
+			});
+
+			it("retains exact action and delete-confirmation targets through filtering and fresh inventory replacement", async () => {
+				const target = disk("Needle target", "/historical/target", 1);
+				const a = { ...runtimeInfo("Needle live", "/a"), needsAttention: true };
+				const b = runtimeInfo("Other live", "/b");
+				const { el, store, setFleet } = fixture([b, a], [disk("Other past", "/other", 2), target]);
+				search(el, "needle");
+				attention(el).click();
+				el.querySelector<HTMLButtonElement>(".session-card .btn-primary")!.click();
+				expect(store.navigate).toHaveBeenCalledWith({ screen: "session", key: "Needle live" });
+				el.querySelector<HTMLButtonElement>(".session-card .btn-danger")!.click();
+				await vi.waitFor(() => expect(api.stopRuntime).toHaveBeenCalledWith("Needle live"));
+				el.querySelector<HTMLButtonElement>(".disk-row .btn-danger")!.click();
+				setFleet({ runtimes: [b, a], diskSessions: [{ ...target, name: "Renamed away" }] });
+				expect(diskNames(el)).toEqual([]);
+				el.querySelector<HTMLButtonElement>(".modal .btn-danger")!.click();
+				await vi.waitFor(() => expect(api.deleteSession).toHaveBeenCalledWith(target.path));
+			});
+
+			it("keeps the rename target bound to its file through filtering, reordering, and fresh inventory", async () => {
+				const target = disk("Needle target", "/historical/target", 1);
+				const other = disk("Other past", "/other", 2);
+				const { el, setFleet } = fixture([], [other, target]);
+				search(el, "needle");
+				[...el.querySelectorAll<HTMLButtonElement>(".disk-row .actions .btn")]
+					.find((button) => button.textContent === "rename")!
+					.click();
+				// Fresh inventory replaces objects, reorders rows, and the filter now hides the target row.
+				setFleet({ runtimes: [], diskSessions: [{ ...target, name: "Renamed elsewhere" }, other] });
+				expect(diskNames(el)).toEqual([]);
+				const input = el.querySelector<HTMLInputElement>("#rename-session-name")!;
+				expect(input.value).toBe("Needle target");
+				input.value = "Needle renamed";
+				input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+				el.querySelector<HTMLButtonElement>(".rename-session-modal .btn-primary")!.click();
+				await vi.waitFor(() => expect(api.renameDiskSession).toHaveBeenCalledWith(target.path, "Needle renamed"));
+			});
+
+			it("searches the recorded historical path and keeps its missing-directory chooser bound to that exact file", async () => {
+				const target = { ...disk("Target", "/home/test/Old-project", 1), cwdAvailable: false };
+				const { el } = fixture([], [disk("Other", "/other", 2), target]);
+				vi.mocked(api.createRuntime).mockClear();
+				search(el, " ~/OLD-project ");
+				expect(diskNames(el)).toEqual(["Target"]);
+				el.querySelector<HTMLButtonElement>(".disk-row .btn")!.click();
+				expect(el.querySelector(".resume-historical-cwd")?.textContent).toBe(target.cwd);
+				expect(api.createRuntime).not.toHaveBeenCalled();
+				const input = el.querySelector<HTMLInputElement>("#resume-runtime-cwd")!;
+				input.value = "/replacement";
+				input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+				el.querySelector<HTMLButtonElement>(".resume-session-modal .btn-primary")!.click();
+				await vi.waitFor(() =>
+					expect(api.createRuntime).toHaveBeenCalledWith("/replacement", { sessionPath: target.path }),
+				);
+				expect(target.cwd).toBe("/home/test/Old-project");
+			});
+
+			it("shows genuine empty inventory separately and preserves error banners with no matching results", () => {
+				const { el: empty, dispose: disposeEmpty } = fixture([]);
+				search(empty, "missing");
+				expect(empty.textContent).toContain("No sessions yet.");
+				expect(empty.querySelector("#fleet-search")).not.toBeNull();
+				expect(clear(empty).disabled).toBe(false);
+				disposeEmpty();
+				empty.remove();
+				const base = makeStore();
+				const el = mount(() => (
+					<FleetScreen
+						store={{
+							...base,
+							fleet: () => ({ runtimes: [runtimeInfo("Other")], diskSessions: [disk("Past", "/past", 1)] }),
+							fleetError: () => "inventory unavailable",
+							fleetStatsError: () => "stats unavailable",
+						}}
+					/>
+				));
+				search(el, "missing");
+				expect(el.textContent).toContain("No live sessions match these filters.");
+				expect(el.textContent).toContain("No past sessions match this search.");
+				expect(el.textContent).not.toContain("No sessions yet.");
+				expect(el.textContent).toContain("inventory unavailable");
+				expect(el.textContent).toContain("stats unavailable");
+				expect(header(el, "name")).not.toBeNull();
+			});
+
+			it("counts unknown creation dates only on the live cards the filters leave visible", () => {
+				const dated = { ...runtimeInfo("Charlie", "/live/c"), needsAttention: true };
+				dated.state.sessionFile = "/sessions/Charlie.jsonl";
+				const undatedA = { ...runtimeInfo("Alpha", "/live/a"), needsAttention: true };
+				const undatedB = runtimeInfo("Bravo", "/live/b");
+				const { el } = fixture([dated, undatedA, undatedB], [disk("Charlie", "/live/c", 1)]);
+				header(el, "created").click();
+				expect(names(el)).toEqual(["Charlie", "Alpha", "Bravo"]);
+				expect(el.querySelector(".fleet-live-note")?.textContent).toBe(
+					"2 live sessions have no known creation date yet, so they are listed last.",
+				);
+				attention(el).click(); // hides Bravo
+				expect(names(el)).toEqual(["Charlie", "Alpha"]);
+				expect(el.querySelector(".fleet-live-note")?.textContent).toBe(
+					"1 live session has no known creation date yet, so it is listed last.",
+				);
+				search(el, "charlie"); // leaves only the card whose creation date is known
+				expect(names(el)).toEqual(["Charlie"]);
+				expect(el.querySelector(".fleet-live-note")).toBeNull();
+				clear(el).click();
+				expect(el.querySelector(".fleet-live-note")?.textContent).toContain("2 live sessions");
+			});
+		});
+
+		it("exposes five native sort keys and Reset, defaults first clicks, reverses, persists and adds no requests", () => {
+			const runtimes = [runtimeInfo("b", "/b"), runtimeInfo("a", "/a")];
+			const { el } = fixture(runtimes);
+			const buttons = [...el.querySelectorAll<HTMLButtonElement>(".live-sessions .fleet-sort-header")];
+			const reset = el.querySelector<HTMLButtonElement>(".fleet-sort-reset")!;
+			expect(buttons.map((button) => button.dataset.sortKey)).toEqual([
+				"name",
+				"created",
+				"started",
+				"activity",
+				"path",
+			]);
+			expect(el.querySelector("select, .fleet-sort-toolbar, [role='toolbar']")).toBeNull();
+			expect(reset.type).toBe("button");
+			expect(reset.getAttribute("aria-label")).toBe("Reset Fleet sorting");
+			expect(reset.disabled).toBe(true);
+			expect(names(el)).toEqual(["a", "b"]);
+			expect(window.localStorage.getItem(FLEET_SORT_KEY)).toBeNull();
+			expect(el.querySelector("#fleet-sort-help")?.classList.contains("fleet-visually-hidden")).toBe(true);
+			expect(el.querySelector("#fleet-sort-help")?.tagName).toBe("OUTPUT");
+			for (const button of buttons) {
+				expect(button.type).toBe("button");
+				expect(button.disabled).toBe(false);
+				expect(button.getAttribute("aria-pressed")).toBe("false");
+				expect(button.hasAttribute("data-sort-direction")).toBe(false);
+				expect(button.querySelector(".fleet-sort-arrow")?.textContent).toBe("↕");
+			}
+			const requests = [
+				api.sessions,
+				api.fleet,
+				api.hydrate,
+				api.stats,
+				api.runtime,
+				api.createRuntime,
+				api.stopRuntime,
+				api.deleteSession,
+			];
+			for (const request of requests) vi.mocked(request).mockClear();
+			reset.click();
+			expect(window.localStorage.getItem(FLEET_SORT_KEY)).toBeNull();
+			for (const { key, label } of FLEET_SORT_OPTIONS) {
+				if (key === "default") continue;
+				const button = header(el, key);
+				const direction = key === "created" || key === "started" || key === "activity" ? "desc" : "asc";
+				const reversed = direction === "asc" ? "desc" : "asc";
+				expect(button.getAttribute("aria-label")).toBe(`Sort by ${label}`);
+				button.click();
+				expect(button.dataset.sortDirection).toBe(direction);
+				expect(button.getAttribute("aria-pressed")).toBe("true");
+				expect(button.getAttribute("aria-label")).toBe(
+					`Sort by ${label}, ${direction === "asc" ? "ascending" : "descending"}`,
+				);
+				expect(reset.disabled).toBe(false);
+				expect(JSON.parse(window.localStorage.getItem(FLEET_SORT_KEY)!)).toEqual({ key, direction });
+				button.click();
+				expect(button.dataset.sortDirection).toBe(reversed);
+				expect(button.getAttribute("aria-label")).toBe(
+					`Sort by ${label}, ${reversed === "asc" ? "ascending" : "descending"}`,
+				);
+				expect(JSON.parse(window.localStorage.getItem(FLEET_SORT_KEY)!)).toEqual({ key, direction: reversed });
+				if (key === "name") expect(names(el)).toEqual(["b", "a"]);
+			}
+			const remounted = fixture(runtimes).el;
+			expect(header(remounted, "path").dataset.sortDirection).toBe("desc");
+			expect(names(remounted)).toEqual(["b", "a"]);
+			reset.click();
+			expect(reset.disabled).toBe(true);
+			expect(names(el)).toEqual(["a", "b"]);
+			expect(names(remounted)).toEqual(["a", "b"]);
+			expect(JSON.parse(window.localStorage.getItem(FLEET_SORT_KEY)!)).toEqual(DEFAULT_FLEET_SORT);
+			for (const button of buttons) {
+				expect(button.getAttribute("aria-pressed")).toBe("false");
+				expect(button.hasAttribute("data-sort-direction")).toBe(false);
+			}
+			for (const request of requests) expect(request).not.toHaveBeenCalled();
+		});
+
+		it("shares one history table and heading row across project groups without repeating sort controls", () => {
+			const { el } = fixture(
+				[],
+				[
+					disk("Zulu", "/a", 6),
+					disk("Yankee", "/a", 5),
+					disk("Xray", "/a", 4),
+					disk("Whiskey", "/a", 3),
+					disk("Bravo", "/b", 2),
+					disk("Charlie", "/c", 1),
+				],
+			);
+			const past = el.querySelector<HTMLElement>(".past-sessions")!;
+			const table = past.querySelector<HTMLTableElement>(".fleet-session-table")!;
+			const thead = table.querySelector("thead")!;
+			expect(past.querySelectorAll("table")).toHaveLength(1);
+			expect(table.querySelectorAll("thead")).toHaveLength(1);
+			expect(thead.querySelectorAll("tr")).toHaveLength(1);
+			expect(thead.querySelectorAll("th")).toHaveLength(5);
+			for (const th of thead.querySelectorAll("th")) {
+				expect(th.getAttribute("scope")).toBe("col");
+				expect(th.tagName).toBe("TH");
+			}
+			for (const id of ["fleet-messages-column", "fleet-actions-column"]) {
+				const th = thead.querySelector(`#${id}`)!;
+				expect(th.querySelector("button, a, input, select, [role='button'], [tabindex]")).toBeNull();
+				expect(th.hasAttribute("tabindex")).toBe(false);
+				expect(th.hasAttribute("aria-sort")).toBe(false);
+			}
+			expect(
+				[...thead.querySelectorAll(".fleet-sort-header")].map((button) => button.getAttribute("data-sort-key")),
+			).toEqual(["name", "created", "activity"]);
+			expect([...thead.querySelectorAll("th")].map((th) => th.textContent?.replace(/[↕↑↓]/g, ""))).toEqual([
+				"Session",
+				"Created",
+				"Last activity",
+				"Messages",
+				"Actions",
+			]);
+			expect(past.querySelectorAll(".fleet-section-head .fleet-sort-header")).toHaveLength(1);
+			expect(header(past.querySelector(".fleet-section-head")!, "path")).not.toBeNull();
+			expect(past.querySelectorAll(".fleet-sort-reset")).toHaveLength(1);
+			const groups = [...table.querySelectorAll<HTMLElement>("tbody.project-group")];
+			expect(groups).toHaveLength(3);
+			expect(groups.map((group) => group.querySelector(".group-head h3")?.textContent)).toEqual(["/a", "/b", "/c"]);
+			for (const group of groups) {
+				expect(group.parentElement).toBe(table);
+				expect(group.querySelector("thead, .fleet-sort-header, .fleet-sort-reset")).toBeNull();
+				for (const row of group.querySelectorAll(".disk-row")) {
+					expect(row.querySelector(".name")).not.toBeNull();
+					expect([...row.querySelectorAll(".actions button")].map((button) => button.textContent)).toEqual([
+						"resume",
+						"rename",
+						"delete",
+					]);
+				}
+			}
+			expect(groups[0].querySelectorAll(".disk-row")).toHaveLength(3);
+			expect(groups[0].querySelector(".disk-more")?.textContent).toContain("all 4 on disk");
+			header(thead, "name").click();
+			expect([...table.querySelectorAll(".group-head h3")].map((heading) => heading.textContent)).toEqual([
+				"/b",
+				"/c",
+				"/a",
+			]);
+			expect(past.querySelector("table")).toBe(table);
+			expect(table.querySelector("thead")).toBe(thead);
+			expect([...table.querySelectorAll("tbody.project-group")]).toEqual([groups[1], groups[2], groups[0]]);
+			expect(diskNames(groups[0])).toEqual(["Whiskey", "Xray", "Yankee"]);
+		});
+
+		it.each([
+			{ key: "name", firstDirection: "asc", column: "fleet-session-column" },
+			{ key: "created", firstDirection: "desc", column: "fleet-created-column" },
+			{ key: "activity", firstDirection: "desc", column: "fleet-activity-column" },
+			{ key: "path", firstDirection: "asc", column: undefined },
+		] as const)(
+			"shares $key arrows and directions between live and history, with aria-sort only on its column",
+			({ key, firstDirection, column }) => {
+				const a = runtimeInfo("a", "/a");
+				const b = runtimeInfo("b", "/b");
+				a.state.sessionFile = "/sessions/a.jsonl";
+				b.state.sessionFile = "/sessions/b.jsonl";
+				a.lastActivity = date(1);
+				b.lastActivity = date(2);
+				const { el } = fixture(
+					[b, a],
+					[disk("a", "/a", 1), disk("b", "/b", 2), disk("Alpha", "/history/a", 1), disk("Zulu", "/history/z", 2)],
+				);
+				const live = el.querySelector<HTMLElement>(".live-sessions")!;
+				const past = el.querySelector<HTMLElement>(".past-sessions")!;
+				const label = FLEET_SORT_OPTIONS.find((option) => option.key === key)!.label;
+				const assertDirection = (direction: "asc" | "desc") => {
+					for (const button of el.querySelectorAll<HTMLButtonElement>(".fleet-sort-header")) {
+						const active = button.dataset.sortKey === key;
+						expect(button.getAttribute("aria-pressed")).toBe(String(active));
+						expect(button.classList.contains("active")).toBe(active);
+						expect(button.dataset.sortDirection).toBe(active ? direction : undefined);
+						expect(button.querySelector(".fleet-sort-arrow")?.textContent).toBe(
+							active ? (direction === "asc" ? "↑" : "↓") : "↕",
+						);
+						expect(button.querySelector(".fleet-sort-arrow")?.getAttribute("aria-hidden")).toBe("true");
+						if (active)
+							expect(button.getAttribute("aria-label")).toBe(
+								`Sort by ${label}, ${direction === "asc" ? "ascending" : "descending"}`,
+							);
+					}
+					const sortedColumns = [...past.querySelectorAll("thead th[aria-sort]")];
+					expect(sortedColumns).toEqual(column ? [past.querySelector(`#${column}`)] : []);
+					if (column)
+						expect(sortedColumns[0].getAttribute("aria-sort")).toBe(
+							direction === "asc" ? "ascending" : "descending",
+						);
+					expect(names(el)).toEqual(direction === "asc" ? ["a", "b"] : ["b", "a"]);
+					expect(diskNames(past)).toEqual(direction === "asc" ? ["Alpha", "Zulu"] : ["Zulu", "Alpha"]);
+				};
+				expect(past.querySelector("thead th[aria-sort]")).toBeNull();
+				header(live, key).click();
+				assertDirection(firstDirection);
+				header(past, key).click();
+				assertDirection(firstDirection === "asc" ? "desc" : "asc");
+				past.querySelector<HTMLButtonElement>(".fleet-sort-reset")!.click();
+				expect(past.querySelector("thead th[aria-sort]")).toBeNull();
+				for (const button of el.querySelectorAll<HTMLButtonElement>(".fleet-sort-header")) {
+					expect(button.getAttribute("aria-pressed")).toBe("false");
+					expect(button.hasAttribute("data-sort-direction")).toBe(false);
+					expect(button.querySelector(".fleet-sort-arrow")?.textContent).toBe("↕");
+				}
+				for (const reset of el.querySelectorAll<HTMLButtonElement>(".fleet-sort-reset"))
+					expect(reset.disabled).toBe(true);
+			},
+		);
+
+		it("keeps Messages informational rather than introducing a message-count sort", () => {
+			const { el } = fixture(
+				[],
+				[
+					{ ...disk("Alpha", "/a", 1), messageCount: 99 },
+					{ ...disk("Beta", "/a", 2), messageCount: 1 },
+					{ ...disk("Zulu", "/a", 3), messageCount: 40 },
+				],
+			);
+			header(el, "name").click();
+			const messages = el.querySelector<HTMLElement>("thead #fleet-messages-column")!;
+			expect(messages.textContent).toBe("Messages");
+			expect(messages.getAttribute("scope")).toBe("col");
+			expect(messages.querySelector("button, a, input, select, [role='button'], [tabindex]")).toBeNull();
+			expect(messages.hasAttribute("tabindex")).toBe(false);
+			expect(messages.hasAttribute("aria-sort")).toBe(false);
+			expect(messages.hasAttribute("data-sort-key")).toBe(false);
+			const preference = window.localStorage.getItem(FLEET_SORT_KEY);
+			messages.click();
+			expect(diskNames(el)).toEqual(["Alpha", "Beta", "Zulu"]);
+			expect([...el.querySelectorAll(".disk-messages")].map((cell) => cell.textContent)).toEqual(["99", "1", "40"]);
+			for (const cell of el.querySelectorAll(".disk-messages"))
+				expect(cell.getAttribute("headers")).toBe("fleet-messages-column");
+			expect(window.localStorage.getItem(FLEET_SORT_KEY)).toBe(preference);
+			expect(header(el, "name").dataset.sortDirection).toBe("asc");
+			expect(el.querySelectorAll("thead th[aria-sort]")).toHaveLength(1);
+			expect(messages.hasAttribute("aria-sort")).toBe(false);
+		});
+
+		it("renders creation and activity as semantic times, with em dashes and no time for unknown or invalid dates", () => {
+			const known = { ...disk("Known", "/a", 1), modified: date(2) };
+			const { el } = fixture(
+				[],
+				[
+					known,
+					{ ...disk("Unknown", "/a", 3), created: "", modified: "" },
+					{ ...disk("Invalid", "/a", 4), created: "not a creation date", modified: "not an activity date" },
+				],
+			);
+			const rows = [...el.querySelectorAll(".disk-row")];
+			const knownRow = rows.find((row) => row.querySelector(".name")?.textContent === "Known")!;
+			for (const [selector, value, column] of [
+				[".disk-created", known.created, "fleet-created-column"],
+				[".disk-activity", known.modified, "fleet-activity-column"],
+			]) {
+				const cell = knownRow.querySelector(selector)!;
+				const time = cell.querySelector<HTMLTimeElement>("time")!;
+				expect(cell.getAttribute("headers")).toBe(column);
+				expect(time.dateTime).toBe(value);
+				expect(time.getAttribute("title")).toBe(new Date(value).toLocaleString());
+				expect(time.textContent).toBeTruthy();
+			}
+			for (const row of rows.filter((row) => row !== knownRow)) {
+				for (const [selector, label] of [
+					[".disk-created", "session creation"],
+					[".disk-activity", "last activity"],
+				]) {
+					const cell = row.querySelector(selector)!;
+					expect(cell.textContent).toBe("—");
+					expect(cell.querySelector("time")).toBeNull();
+					expect(cell.querySelector("span")?.getAttribute("title")).toBe(`Unknown ${label}`);
+				}
+			}
+			for (const key of ["created", "activity"] as const) {
+				header(el, key).click();
+				expect(diskNames(el)[0]).toBe("Known");
+				header(el, key).click();
+				expect(diskNames(el)[0]).toBe("Known");
+			}
+			expect(el.querySelectorAll(".disk-row time")).toHaveLength(2);
+			expect(el.textContent).not.toContain("Invalid Date");
+		});
+
+		it("keeps history headings and Project/Reset usable without live sessions, including a saved Started preference", () => {
+			setFleetSort({ key: "started", direction: "asc" });
+			const { el } = fixture(
+				[],
+				[
+					{ ...disk("Alpha", "/a", 1), modified: date(3) },
+					{ ...disk("Beta", "/a", 2), modified: date(2) },
+					{ ...disk("Zulu", "/z", 3), modified: date(1) },
+				],
+			);
+			expect(el.querySelector(".live-sessions")).toBeNull();
+			expect(
+				[...el.querySelectorAll(".fleet-sort-header")].map((button) => button.getAttribute("data-sort-key")).sort(),
+			).toEqual(["activity", "created", "name", "path"]);
+			const note = el.querySelector<HTMLElement>(".fleet-history-note")!;
+			expect(note.textContent).toContain("live sessions only");
+			expect(note.classList.contains("fleet-visually-hidden")).toBe(false);
+			expect(note.closest('[hidden], [aria-hidden="true"]')).toBeNull();
+			expect(diskNames(el)).toEqual(["Alpha", "Beta", "Zulu"]);
+			expect(el.querySelector("thead th[aria-sort]")).toBeNull();
+			header(el, "created").click();
+			expect(diskNames(el)).toEqual(["Zulu", "Beta", "Alpha"]);
+			expect(el.querySelector(".fleet-history-note")).toBeNull();
+			header(el, "created").click();
+			expect(diskNames(el)).toEqual(["Alpha", "Beta", "Zulu"]);
+			header(el, "path").click();
+			expect([...el.querySelectorAll(".group-head h3")].map((heading) => heading.textContent)).toEqual(["/a", "/z"]);
+			header(el, "path").click();
+			expect([...el.querySelectorAll(".group-head h3")].map((heading) => heading.textContent)).toEqual(["/z", "/a"]);
+			const reset = el.querySelector<HTMLButtonElement>('.fleet-sort-reset[aria-label="Reset Fleet sorting"]')!;
+			expect(reset.disabled).toBe(false);
+			reset.click();
+			expect(reset.disabled).toBe(true);
+			expect(diskNames(el)).toEqual(["Alpha", "Beta", "Zulu"]);
+		});
+
+		it("sorts Started only on live cards and explains unchanged history in either direction", () => {
+			const old = { ...runtimeInfo("old", "/a"), createdAt: date(1) };
+			const recent = { ...runtimeInfo("recent", "/z"), createdAt: date(3) };
+			const { el } = fixture([old, recent], [disk("Alpha", "/a", 1), disk("Zulu", "/z", 2)]);
+			for (const expected of [
+				["recent", "old"],
+				["old", "recent"],
+			]) {
+				header(el, "started").click();
+				expect(names(el)).toEqual(expected);
+				expect(diskNames(el)).toEqual(["Zulu", "Alpha"]);
+				expect(el.querySelector(".fleet-history-note")?.textContent).toContain("Past sessions stay newest first");
+				expect(el.querySelector("thead th[aria-sort]")).toBeNull();
+				expect(el.querySelector(".past-sessions .fleet-sort-header[aria-pressed='true']")).toBeNull();
+			}
+			el.querySelector<HTMLButtonElement>(".fleet-sort-reset")!.click();
+			expect(el.querySelector(".fleet-history-note")).toBeNull();
+		});
+
+		it("distinguishes original creation from runtime start and updates when inventory arrives", () => {
+			const old = runtimeInfo("old", "/z");
+			old.createdAt = date(30);
+			old.state.sessionFile = "/sessions/old.jsonl";
+			const recent = runtimeInfo("recent", "/a");
+			recent.createdAt = date(1);
+			recent.state.sessionFile = "/sessions/recent.jsonl";
+			const { el, setFleet } = fixture([old, recent], [disk("old", "/original", 2)]);
+			header(el, "created").click();
+			header(el, "created").click(); // oldest original creation first
+			expect(names(el)).toEqual(["old", "recent"]); // unknown remains last, not runtime-start substitution
+			expect(el.querySelector("#fleet-sort-help")?.textContent).toContain("Unknown dates");
+			// Sighted users see why the card is last, not only screen-reader help.
+			expect(el.querySelector(".live-sessions .fleet-live-note")?.textContent).toBe(
+				"1 live session has no known creation date yet, so it is listed last.",
+			);
+			setFleet({ runtimes: [old, recent], diskSessions: [disk("old", "/original", 2), disk("recent", "/a", 1)] });
+			expect(names(el)).toEqual(["recent", "old"]);
+			expect(el.querySelector(".fleet-live-note")).toBeNull();
+			header(el, "started").click();
+			header(el, "started").click(); // oldest runtime start first
+			expect(names(el)).toEqual(["recent", "old"]);
+			expect(el.querySelector("#fleet-sort-help")?.textContent).toContain(
+				"Past sessions keep their default newest-first",
+			);
+			header(el, "created").click(); // newest original first: the opposite of newest runtime first
+			expect(names(el)).toEqual(["old", "recent"]);
+		});
+
+		it("explains every unknown live creation date only while Session created is selected", () => {
+			const runtimes = ["a", "b", "c"].map((key) => runtimeInfo(key, `/${key}`));
+			const { el } = fixture(runtimes, []);
+			expect(el.querySelector(".fleet-live-note")).toBeNull(); // Default needs no creation date
+			header(el, "created").click();
+			expect(el.querySelector(".fleet-live-note")?.textContent).toBe(
+				"3 live sessions have no known creation date yet, so they are listed last.",
+			);
+			header(el, "name").click();
+			expect(el.querySelector(".fleet-live-note")).toBeNull();
+		});
+
+		it("sorts full groups before truncation and preserves group DOM, expansion and focus across movement", async () => {
+			const entries = [
+				disk("Z", "/a", 6),
+				disk("Y", "/a", 5),
+				disk("X", "/a", 4),
+				disk("A", "/a", 1),
+				disk("B", "/b", 3),
+			];
+			const { el } = fixture([], entries);
+			const group = el.querySelector<HTMLElement>(".project-group")!;
+			expect(group.querySelectorAll(".disk-row")).toHaveLength(3);
+			header(el, "name").click();
+			expect([...group.querySelectorAll(".disk-row .name")].map((n) => n.textContent)).toEqual(["A", "X", "Y"]);
+			group.querySelector<HTMLButtonElement>(".disk-more")!.click();
+			expect(group.querySelectorAll(".disk-row")).toHaveLength(4);
+			const toggle = group.querySelector<HTMLButtonElement>(".disk-more")!;
+			toggle.focus();
+			setFleetSort({ key: "path", direction: "desc" });
+			expect([...el.querySelectorAll(".group-head h3")].map((n) => n.textContent)).toEqual(["/b", "/a"]);
+			expect(el.querySelectorAll(".project-group")[1]).toBe(group);
+			expect(group.querySelectorAll(".disk-row")).toHaveLength(4);
+			await Promise.resolve(); // focus is restored after DOM reconciliation
+			expect(document.activeElement).toBe(toggle);
+		});
+
+		it.each(["resume", "delete"])(
+			"retains a surviving row's %s action focus across fresh metadata replacement and reorder",
+			async (action) => {
+				const entries = [
+					disk("Alpha", "/a", 4),
+					disk("Beta", "/a", 3),
+					disk("Gamma", "/a", 2),
+					disk("Target", "/a", 1),
+					disk("Other", "/b", 5),
+				];
+				const { el, setFleet } = fixture([], entries);
+				header(el, "activity").click();
+				const group = [...el.querySelectorAll<HTMLElement>(".project-group")].find(
+					(candidate) => candidate.querySelector(".group-head h3")?.textContent === "/a",
+				)!;
+				group.querySelector<HTMLButtonElement>(".disk-more")!.click(); // keep the target mounted even outside the three-row preview
+				const row = [...group.querySelectorAll(".disk-row")].find(
+					(candidate) => candidate.querySelector(".name")?.textContent === "Target",
+				)!;
+				const button = [...row.querySelectorAll<HTMLButtonElement>(".actions button")].find(
+					(candidate) => candidate.textContent === action,
+				)!;
+				button.focus();
+				expect(document.activeElement).toBe(button);
+				const refreshed = entries.map((session) => ({
+					...session,
+					...(session.id === "Target" ? { name: "Target refreshed", modified: date(10), messageCount: 42 } : {}),
+				}));
+				setFleet({ runtimes: [], diskSessions: refreshed });
+				await Promise.resolve();
+				expect(el.querySelector(".project-group")).toBe(group);
+				expect(group.querySelector(".disk-row")).toBe(row);
+				expect(group.querySelectorAll(".disk-row")).toHaveLength(4);
+				expect(row.querySelector(".name")?.textContent).toBe("Target refreshed");
+				expect(row.querySelector(".disk-messages")?.textContent).toBe("42");
+				expect(row.querySelector<HTMLTimeElement>(".disk-activity time")?.dateTime).toBe(date(10));
+				expect(
+					[...row.querySelectorAll(".actions button")].find((candidate) => candidate.textContent === action),
+				).toBe(button);
+				expect(button.isConnected).toBe(true);
+				expect(document.activeElement).toBe(button);
+				header(el, "activity").click(); // reverse without replacing the expanded, still-visible target row
+				await Promise.resolve();
+				expect([...group.querySelectorAll(".disk-row")].at(-1)).toBe(row);
+				expect(document.activeElement).toBe(button);
+			},
+		);
+
+		it("never restores focus over a deliberate new focus target or after the Fleet is unmounted", async () => {
+			const store = {
+				...makeStore(),
+				fleet: () => ({ runtimes: [runtimeInfo("a", "/a"), runtimeInfo("b", "/b")], diskSessions: [] }),
+			};
+			const { container, dispose } = mountDisposable(() => <FleetScreen store={store} />);
+			try {
+				const first = container.querySelector<HTMLButtonElement>(".session-card .btn-primary")!;
+				first.focus();
+				setFleetSort({ key: "path", direction: "desc" });
+				const sort = header(container, "path");
+				sort.focus();
+				await Promise.resolve();
+				expect(document.activeElement).toBe(sort);
+				first.focus();
+				setFleetSort(DEFAULT_FLEET_SORT);
+				dispose();
+				await Promise.resolve();
+				expect(document.activeElement).not.toBe(first);
+				expect(first.isConnected).toBe(false);
+			} finally {
+				dispose();
+				container.remove();
+			}
+		});
+
+		it("keeps the explicit historical-directory chooser bound to its sorted session", async () => {
+			const moved = { ...disk("Zulu", "/gone/z", 3), cwdAvailable: false };
+			const { el } = fixture([], [disk("Alpha", "/a", 1), moved]);
+			header(el, "name").click();
+			header(el, "name").click();
+			vi.mocked(api.createRuntime).mockClear();
+			el.querySelector<HTMLButtonElement>(".disk-row .btn")!.click();
+			expect(el.querySelector(".resume-historical-cwd")?.textContent).toBe("/gone/z");
+			expect(api.createRuntime).not.toHaveBeenCalled();
+			header(el, "name").click();
+			const input = el.querySelector<HTMLInputElement>("#resume-runtime-cwd")!;
+			input.value = "/replacement";
+			input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+			el.querySelector<HTMLButtonElement>(".resume-session-modal .btn-primary")!.click();
+			await vi.waitFor(() =>
+				expect(api.createRuntime).toHaveBeenCalledWith("/replacement", { sessionPath: "/sessions/Zulu.jsonl" }),
+			);
+			expect(moved.cwd).toBe("/gone/z");
+		});
+
+		it("applies live activity/name snapshots and membership without changing Default or losing card identity", async () => {
+			const a = runtimeInfo("a", "/a");
+			a.state.sessionName = "Alpha";
+			a.lastActivity = date(1);
+			const b = runtimeInfo("b", "/b");
+			b.state.sessionName = "Beta";
+			b.lastActivity = date(2);
+			vi.mocked(api.fleet).mockResolvedValueOnce({ runtimes: [b, a], diskSessions: [] });
+			let handlers: EventStreamHandlers | undefined;
+			vi.mocked(connectEvents).mockImplementation((next) => {
+				handlers = next;
+				return () => {};
+			});
+			const store = makeStore();
+			await store.start();
+			const el = mount(() => <FleetScreen store={store} />);
+			let seq = 0;
+			const snapshot = (runtimes: RuntimeInfoDto[]) =>
+				handlers!.onEnvelope!({ seq: ++seq, key: "", event: { type: "fleet_snapshot", runtimes } });
+			try {
+				const openA = el.querySelector<HTMLButtonElement>(".session-card .btn-primary")!;
+				snapshot([{ ...b, lastActivity: date(30), needsAttention: true }, { ...a }]);
+				expect(names(el)).toEqual(["Alpha", "Beta"]);
+				header(el, "activity").click();
+				expect(names(el)).toEqual(["Beta", "Alpha"]);
+				expect(el.querySelectorAll(".session-card .btn-primary")[1]).toBe(openA);
+				snapshot([
+					{ ...a, lastActivity: date(31) },
+					{ ...b, lastActivity: date(30) },
+				]);
+				expect(names(el)).toEqual(["Alpha", "Beta"]);
+				header(el, "name").click();
+				handlers!.onEnvelope!({ seq: ++seq, key: "a", event: { type: "session_name_changed", name: "Zulu" } });
+				expect(names(el)).toEqual(["Beta", "Zulu"]);
+				const c = runtimeInfo("c", "/c");
+				c.state.sessionName = "Charlie";
+				snapshot([b, c]);
+				expect(names(el)).toEqual(["Beta", "Charlie"]);
+			} finally {
+				store.stop();
+			}
+		});
+
+		it("keeps action and confirmation identities correct when the selected order changes", async () => {
+			const entries = [disk("Zulu", "/historical/z", 3), disk("Alpha", "/historical/a", 1)];
+			const { el, store } = fixture([runtimeInfo("b", "/b"), runtimeInfo("a", "/a")], entries);
+			header(el, "name").click();
+			header(el, "name").click();
+			el.querySelector<HTMLButtonElement>(".session-card .btn-primary")!.click();
+			expect(store.navigate).toHaveBeenCalledWith({ screen: "session", key: "b" });
+			el.querySelector<HTMLButtonElement>(".session-card .btn-danger")!.click();
+			await Promise.resolve();
+			expect(api.stopRuntime).toHaveBeenCalledWith("b");
+			el.querySelector<HTMLButtonElement>(".disk-row .btn")!.click();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(api.createRuntime).toHaveBeenCalledWith("/historical/z", { sessionPath: "/sessions/Zulu.jsonl" });
+			el.querySelector<HTMLButtonElement>(".disk-row .btn-danger")!.click();
+			header(el, "name").click();
+			el.querySelector<HTMLButtonElement>(".modal .btn-danger")!.click();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(api.deleteSession).toHaveBeenCalledWith("/sessions/Zulu.jsonl");
+			expect(store.refreshDiskSessions).toHaveBeenCalled();
+		});
+
+		it.each(FLEET_SORT_OPTIONS.map(({ key }) => key))(
+			"leaves session/subagent sidebars stable with Fleet preference %s",
+			(key) => {
+				setFleetSort({ key, direction: "desc" });
+				const a = runtimeInfo("a", "/a");
+				a.state.sessionName = "Zulu";
+				const b = runtimeInfo("b", "/b");
+				b.state.sessionName = "Alpha";
+				b.lastActivity = date(30);
+				const store = {
+					...makeStore(),
+					fleet: () => ({ runtimes: [b, a, runtimeInfo("current", "/current")], diskSessions: [] }),
+					hydrateSession: vi.fn(async () => {}),
+				};
+				const el = mount(() => <SessionScreen store={store} sessionKey="current" />);
+				expect([...el.querySelectorAll(".fleet-sidebar-entry .name")].map((e) => e.textContent)).toEqual([
+					"Zulu",
+					"Alpha",
+				]);
+				const sub = mount(() => <SubagentScreen store={store} sessionKey="current" agentId="bg1" />);
+				expect([...sub.querySelectorAll(".fleet-sidebar-entry .name")].map((e) => e.textContent)).toEqual([
+					"Zulu",
+					"Alpha",
+				]);
+			},
+		);
+	});
+
 	it("groups /tmp sessions under a single fleet project", () => {
 		expect(fleetGroupKey("/tmp")).toBe("/tmp");
 		expect(fleetGroupKey("/tmp/x")).toBe("/tmp");
@@ -6699,7 +7804,7 @@ describe("dashboard client regressions", () => {
 				pendingMessageCount: 0,
 				model: { provider: "github-copilot", id: "claude-fable-5" },
 			},
-			stats: { tokensTotal: 1545, cost: 0.42 },
+			stats: { tokensTotal: 1545, cost: 0.42, subagentCost: 0.17 },
 			backgroundAgents: [],
 			needsAttention: false,
 			createdAt: new Date().toISOString(),
@@ -6734,7 +7839,7 @@ describe("dashboard client regressions", () => {
 		const headers = [...el.querySelectorAll(".group-head h3")].map((node) => node.textContent);
 		expect(headers).toEqual(["/tmp"]);
 		expect(el.textContent).toContain("github-copilot/claude-fable-5");
-		expect(el.textContent).toContain("$0.42");
+		expect(el.textContent).toContain("$0.42 + $0.17 subs");
 		expect(el.textContent).toContain("live fleet name");
 	});
 
@@ -7187,6 +8292,195 @@ describe("dashboard client regressions", () => {
 		expect(api.deleteSession).toHaveBeenCalledWith("/sessions/delete.jsonl");
 		expect(refreshDiskSessions).toHaveBeenCalled();
 		expect(vi.mocked(api.fleet)).not.toHaveBeenCalled();
+	});
+
+	describe("fleet past-session rename", () => {
+		function pastSession(overrides: Partial<SessionInfoDto> = {}): SessionInfoDto {
+			return {
+				path: "/sessions/rename.jsonl",
+				id: "rename",
+				cwd: "/repo",
+				name: "Old name",
+				created: new Date().toISOString(),
+				modified: new Date().toISOString(),
+				messageCount: 4,
+				firstMessage: "Please fix the login flow",
+				...overrides,
+			};
+		}
+
+		function renderFleet(sessions: SessionInfoDto[] = [pastSession()]) {
+			const store = makeStore() as any;
+			const refreshDiskSessions = vi.fn(async () => {});
+			const el = mount(() => (
+				<FleetScreen
+					store={{ ...store, refreshDiskSessions, fleet: () => ({ runtimes: [], diskSessions: sessions }) }}
+				/>
+			));
+			return { el, refreshDiskSessions };
+		}
+
+		function rowButton(el: HTMLElement, label: string, rowIndex = 0): HTMLButtonElement {
+			const row = el.querySelectorAll(".disk-row")[rowIndex]!;
+			return [...row.querySelectorAll<HTMLButtonElement>(".actions .btn")].find((b) => b.textContent === label)!;
+		}
+
+		function modalButton(el: HTMLElement, label: string): HTMLButtonElement {
+			return [...el.querySelectorAll<HTMLButtonElement>(".rename-session-modal button")].find(
+				(b) => b.textContent === label,
+			)!;
+		}
+
+		function nameInput(el: HTMLElement): HTMLInputElement {
+			return el.querySelector<HTMLInputElement>("#rename-session-name")!;
+		}
+
+		function typeName(el: HTMLElement, value: string): void {
+			const input = nameInput(el);
+			input.value = value;
+			input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+		}
+
+		const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+		it("offers resume, rename, and delete in that order on every past-session row", () => {
+			const { el } = renderFleet([
+				pastSession(),
+				pastSession({ path: "/sessions/two.jsonl", id: "two", name: "Two" }),
+			]);
+
+			for (const row of el.querySelectorAll(".disk-row")) {
+				expect([...row.querySelectorAll(".actions .btn")].map((b) => b.textContent)).toEqual([
+					"resume",
+					"rename",
+					"delete",
+				]);
+			}
+		});
+
+		it("pre-fills the current name and renames with the trimmed value", async () => {
+			const { el, refreshDiskSessions } = renderFleet();
+			rowButton(el, "rename").click();
+
+			expect(nameInput(el).value).toBe("Old name");
+			typeName(el, "  New name  ");
+			modalButton(el, "rename").click();
+			await tick();
+
+			expect(api.renameDiskSession).toHaveBeenCalledWith("/sessions/rename.jsonl", "New name");
+			expect(refreshDiskSessions).toHaveBeenCalled();
+			expect(el.querySelector(".rename-session-modal")).toBeNull();
+		});
+
+		it("starts unnamed sessions empty with the first message as a placeholder", () => {
+			const { el } = renderFleet([pastSession({ name: undefined })]);
+			rowButton(el, "rename").click();
+
+			expect(nameInput(el).value).toBe("");
+			expect(nameInput(el).placeholder).toBe("Please fix the login flow");
+			expect(modalButton(el, "rename").disabled).toBe(true);
+			typeName(el, "   ");
+			expect(modalButton(el, "rename").disabled).toBe(true);
+		});
+
+		it("keeps the modal open with an alert when renaming fails", async () => {
+			vi.mocked(api.renameDiskSession).mockRejectedValue(new Error("Session name was not saved"));
+			const { el, refreshDiskSessions } = renderFleet();
+			rowButton(el, "rename").click();
+			typeName(el, "New name");
+			modalButton(el, "rename").click();
+			await tick();
+
+			expect(el.querySelector(".rename-session-modal")).not.toBeNull();
+			expect(el.querySelector('.rename-session-modal [role="alert"]')?.textContent).toBe(
+				"Failed to rename session: Session name was not saved",
+			);
+			expect(refreshDiskSessions).not.toHaveBeenCalled();
+		});
+
+		it("auto-generate fills the input for this session and blocks a second request while busy", async () => {
+			let resolveTitle: (value: { title: string }) => void = () => {};
+			vi.mocked(api.generateSessionTitle).mockImplementation(
+				() =>
+					new Promise((resolve) => {
+						resolveTitle = resolve;
+					}),
+			);
+			const { el } = renderFleet();
+			rowButton(el, "rename").click();
+
+			modalButton(el, "auto-generate").click();
+			await tick();
+			expect(modalButton(el, "generating…").disabled).toBe(true);
+			expect(modalButton(el, "rename").disabled).toBe(true);
+			modalButton(el, "generating…").click();
+			expect(api.generateSessionTitle).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(api.generateSessionTitle).mock.calls[0][0]).toBe("/sessions/rename.jsonl");
+
+			resolveTitle({ title: "Fix login flow" });
+			await tick();
+			expect(nameInput(el).value).toBe("Fix login flow");
+			expect(modalButton(el, "rename").disabled).toBe(false);
+			expect(api.renameDiskSession).not.toHaveBeenCalled();
+		});
+
+		it("shows generation failures as an alert and keeps the typed name", async () => {
+			vi.mocked(api.generateSessionTitle).mockRejectedValue(
+				new Error("Tab title generation failed: no model is available (set a default model or tabTitle.model)"),
+			);
+			const { el } = renderFleet();
+			rowButton(el, "rename").click();
+			typeName(el, "Typed");
+
+			modalButton(el, "auto-generate").click();
+			await tick();
+
+			expect(el.querySelector('.rename-session-modal [role="alert"]')?.textContent).toBe(
+				"Failed to generate a title: Tab title generation failed: no model is available (set a default model or tabTitle.model)",
+			);
+			expect(nameInput(el).value).toBe("Typed");
+		});
+
+		it("drops a generated title that arrives after the modal closed", async () => {
+			let resolveTitle: (value: { title: string }) => void = () => {};
+			let signal: AbortSignal | undefined;
+			vi.mocked(api.generateSessionTitle).mockImplementation((_path, abortSignal) => {
+				signal = abortSignal;
+				return new Promise((resolve) => {
+					resolveTitle = resolve;
+				});
+			});
+			const { el } = renderFleet([
+				pastSession(),
+				pastSession({ path: "/sessions/two.jsonl", id: "two", name: "Two" }),
+			]);
+			rowButton(el, "rename").click();
+			modalButton(el, "auto-generate").click();
+			await tick();
+
+			modalButton(el, "cancel").click();
+			expect(signal?.aborted).toBe(true);
+			rowButton(el, "rename", 1).click();
+			resolveTitle({ title: "Late title" });
+			await tick();
+
+			expect(nameInput(el).value).toBe("Two");
+			expect(el.querySelector('.rename-session-modal [role="alert"]')).toBeNull();
+		});
+
+		it("shows delete failures in the confirmation instead of swallowing them", async () => {
+			vi.mocked(api.deleteSession).mockRejectedValue(new Error("Cannot delete the currently active session"));
+			const { el, refreshDiskSessions } = renderFleet();
+			rowButton(el, "delete").click();
+			el.querySelector<HTMLButtonElement>(".modal .btn-danger")!.click();
+			await tick();
+
+			expect(el.querySelector(".modal")).not.toBeNull();
+			expect(el.querySelector('.modal [role="alert"]')?.textContent).toBe(
+				"Failed to delete session: Cannot delete the currently active session",
+			);
+			expect(refreshDiskSessions).not.toHaveBeenCalled();
+		});
 	});
 
 	it("fleet polls stats every 30 seconds without an immediate round and cleans up on unmount", async () => {

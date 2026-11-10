@@ -14,10 +14,14 @@ This builds all packages in dependency order: tui → ai → agent → semantic-
 
 ## Node & npm Toolchain
 
-- **Node:** `22.x` (enforced via `engines.node` in every workspace `package.json`, plus `.nvmrc` / `.node-version`). The Node 22 line bundles npm 10.x — that's what local dev and the CI `check`/`test` jobs run, and what generated the committed `package-lock.json`.
-- **`packageManager` pin:** the root `package.json` pins `packageManager: npm@11.5.1`. This deliberately matches the version the **publish** workflow (`.github/workflows/publish.yml`) upgrades to, because npm trusted publishing (OIDC provenance) requires npm ≥ 11.5.1. Keep these two in lockstep: if you bump one, bump the other.
-- **Publish workflow ordering matters:** the publish job runs `npm ci` + `npm run build` on the stock npm 10.x bundled with Node 22, and only *then* upgrades to npm 11.5.1 for the `npm publish` steps. Running `npm ci` under npm 11.5.1 silently skips platform-specific optional dependencies that the lockfile marks `optional: true, peer: true` (e.g. `@rollup/rollup-linux-x64-gnu`, needed by vite/rollup for the dashboard build), which breaks the build. Do not move the npm upgrade above install/build.
-- **Why the npm 10 (dev/install) vs npm 11.5.1 (publish-only) split is safe:** `npm publish` does not touch `package-lock.json`, and installs always run under npm 10.x — the same toolchain that generated the committed lockfile. Lockfile changes only ever come from an intentional `npm install`.
+**One toolchain everywhere: Node.js 26 LTS and the npm it bundles.** Local development, CI, publishing, and lockfile writing all use it — there is no second npm version and no mid-job npm upgrade.
+
+- **Pin:** `.nvmrc` and `.node-version` hold the exact Node version (`nvm install` / `nvm use` in the repo picks it up). Every CI job and the publish workflow use `actions/setup-node` with `node-version-file: .nvmrc`, so the bundled npm is identical in all automation. That npm (≥ 11.5.1) also satisfies npm trusted publishing (OIDC provenance).
+- **Enforcement is done by npm itself:** the root `package.json` `devEngines` requires `node ^<pin>` and `npm ^<bundled npm>` with `onFail: "error"`, so `npm install` / `ci` / `run` fail with `EBADDEVENGINES` on any other Node or npm major. `engines.node` (the runtime users need) is the same range in the root and every workspace.
+- **Single lockfile writer:** only the pinned npm writes `package-lock.json`. CI verifies the lockfile is consistent (`npm ls --all`) and canonical (`npm install --package-lock-only` must be a byte-for-byte no-op), then that `npm run build` leaves it untouched. Different npm versions write different lockfiles (npm 10 vs 11 differed in `peer` flags, optional-peer entries, and dedupe), so never commit a lockfile written by another npm.
+- **`overrides` gotcha:** adding or changing an `overrides` entry does not re-resolve an already-locked package — npm keeps the old version and merely marks it invalid. Run `npm update <pkg>` for the overridden package, then confirm `npm ls --all` passes (CI enforces it).
+- **Dependency install scripts run only after review.** The pinned npm checks every dependency install script against the root `allowScripts`. On its own it merely warns and still runs a script that has no recorded decision, so the repo `.npmrc` sets `strict-allow-scripts=true`: any install (local, CI, or the publish job) that would run an unreviewed script fails with `ESTRICTALLOWSCRIPTS` before anything executes. (npm 10 and 11.5.1 ran every dependency script unconditionally.) All current entries are `false` because none is needed: prebuilt/WASM binaries ship in the packages (including `fsevents`' macOS binary), and `onnxruntime-node`'s script only downloads CUDA providers dreb does not use. To record a decision for a new package, review its script, then run `npm install-scripts approve <pkg>` or `npm install-scripts deny <pkg>`. `npm install-scripts ls` only sees packages installed on the current platform, so also check the lockfile: every entry with `"hasInstallScript": true` needs a decision, including platform-specific ones such as the macOS-only `fsevents`.
+- **Bumping Node:** one PR that updates `.nvmrc`, `.node-version`, `devEngines` (runtime and the newly bundled npm), and `engines.node` together, then re-normalizes the lockfile with the new npm. `npm run verify-engines` (run in CI) fails if the pins, `devEngines`, and `engines` disagree.
 
 ## Monorepo Structure
 
@@ -90,14 +94,18 @@ The initial startup scan still walks upward from the main or subagent launch cwd
 
 ## UI Ordering — Determinism Over Recency
 
-**Lists of live/long-lived UI cards (fleet sessions, agent strips, etc.) must sort deterministically, not by dynamic activity.** Order by a stable key (e.g. project path alphabetical, then session start time as tiebreak) so cards keep a fixed position. Sorting by `lastActivity` or other constantly-changing signals makes cards jump around on every event — consistency is better UX than dynamic reordering. When a new ordering dimension is needed, add a stable field (like `createdAt`) rather than reusing a mutable one.
+**Lists of live/long-lived UI cards (fleet sessions, agent strips, etc.) must always sort deterministically. Defaults and other surfaces must use stable keys, not dynamic activity.** Order by a stable key (e.g. project path alphabetical, then runtime start time as tiebreak) so cards keep a fixed position. Sorting by `lastActivity` or other constantly-changing signals makes cards jump around on every event — consistency is better UX than implicit dynamic reordering. For default ordering and other surfaces, use stable fields for new ordering dimensions rather than mutable activity signals.
+
+**Narrow exception: explicitly user-selected Fleet home sorts may reorder on updates to the selected key.** Selecting Last activity opts only Fleet into live activity reordering; Default remains stable path/start ordering, unaffected by activity or status changes. Session and subagent fleet sidebars retain their stable path/start comparator regardless of the Fleet preference. Every comparator must still use deterministic ties; reversing the selected direction must not reverse equal-value tiebreaks.
 
 ## Testing
 
 ```bash
-npm test          # Run all workspace tests
+npm test          # Run all workspace tests (offline: live provider tests skip)
 npx vitest --run packages/coding-agent/test/some.test.ts  # Single file
 ```
+
+**Live provider tests are opt-in and cost real money/quota.** They only run with `DREB_LIVE_API=1` (context-overflow tests also need `DREB_LIVE_API_EXPENSIVE=1`). Never enable them without explicit approval, and scope them to a single file/provider. New live tests must gate on `isLiveApiEnabled()` from the package's `test/live-api.ts` — see `packages/coding-agent/docs/development.md`.
 
 Linting:
 

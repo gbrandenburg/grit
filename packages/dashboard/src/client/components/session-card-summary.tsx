@@ -1,6 +1,7 @@
 /** Display-only live-session summary shared by fleet cards and sidebar buttons. */
 import { For, type JSX, Show } from "solid-js";
 import type { RuntimeInfoDto } from "../../shared/protocol.js";
+import { runtimeDisplayName } from "../state/fleet-sorting.js";
 import { pendingQuestionsReason } from "../state/reducer.js";
 import type { AppStore } from "../state/store.js";
 import { relativeTime, runtimeStatus, StatusChip } from "./common.js";
@@ -51,9 +52,7 @@ export function SessionCardSummary(props: { store: AppStore; runtime: RuntimeInf
 	return (
 		<>
 			<span class="session-title">
-				<span class="name">
-					{session()?.sessionName ?? props.runtime.state.sessionName ?? props.runtime.state.sessionId.slice(0, 8)}
-				</span>
+				<span class="name">{runtimeDisplayName(props.runtime, session()?.sessionName)}</span>
 				<StatusChip status={status()} />
 			</span>
 			<span class="session-project" title={props.runtime.cwd}>
@@ -107,7 +106,10 @@ export function SessionCardSummary(props: { store: AppStore; runtime: RuntimeInf
 					<span>·</span>
 				</Show>
 				<Show when={props.runtime.stats}>
-					<span>${props.runtime.stats!.cost.toFixed(2)}</span>
+					<span>
+						${props.runtime.stats!.cost.toFixed(2)}
+						{props.runtime.stats!.subagentCost ? ` + $${props.runtime.stats!.subagentCost.toFixed(2)} subs` : ""}
+					</span>
 					<span>·</span>
 				</Show>
 				<span>{props.runtime.state.messageCount} msgs</span>

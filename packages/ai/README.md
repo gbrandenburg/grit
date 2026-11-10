@@ -444,7 +444,10 @@ const response = await completeSimple(model, {
   messages: [{ role: 'user', content: 'Solve: 2x + 5 = 13' }]
 }, {
   reasoning: 'medium'  // 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-  // Native normalized 'max' is model-aware (currently GPT-5.6 and GPT-6 families). Claude's established xhigh mapping still emits provider-native 'max'.
+  // Native normalized 'max' is model-aware (GPT-5.6, GPT-6, and Claude Opus/Sonnet 4.6+ and Haiku 5.5 on Anthropic Messages/Bedrock).
+  // On Anthropic Messages (including GitHub Copilot) and Bedrock, Claude 'xhigh' and 'max' are sent as the native efforts of the same name.
+  // Use getAvailableThinkingLevels(model) for the supported levels and
+  // clampThinkingLevel(model, level) to apply dreb's capability fallback rules.
 });
 
 // Access thinking and text blocks
@@ -512,8 +515,8 @@ for await (const event of s) {
 
 ### Controlling Thinking Display (Anthropic adaptive models)
 
-Adaptive-thinking Claude models (Opus and Sonnet 4.6–4.x, plus Claude 5 families)
-support a `thinkingDisplay` option on `streamSimple`/`completeSimple`:
+Adaptive-thinking Claude models (Opus and Sonnet 4.6+, Haiku 5+, including the
+Claude 5 families) support a `thinkingDisplay` option on `streamSimple`/`completeSimple`:
 
 ```typescript
 const s = streamSimple(model, context, {
@@ -535,6 +538,12 @@ provider default applies.
 
 Use `supportsAdaptiveThinking(model)` to check whether a model honors this option.
 
+Related capability helpers: `supportsXhigh(model)`, `supportsMax(model)`, and
+`supportsThinkingOff(model)` (false for Claude Opus 5.5+ on Anthropic Messages/Bedrock, where
+thinking cannot be turned off). `clampThinkingLevel(model, level)` applies dreb's shared
+fallback rules (`off` → `minimal` on always-thinking models, `xhigh` → `max` or `high`,
+`max` → `xhigh` → `high`, non-reasoning → `off`).
+
 ## Stop Reasons
 
 Every `AssistantMessage` includes a `stopReason` field that indicates how the generation ended:
@@ -542,7 +551,7 @@ Every `AssistantMessage` includes a `stopReason` field that indicates how the ge
 - `"stop"` - Normal completion, the model finished its response
 - `"length"` - Output hit the maximum token limit
 - `"toolUse"` - Model is calling tools and expects tool results
-- `"error"` - An error occurred during generation
+- `"error"` - An error occurred during generation, including a safety refusal (see [Safety Refusals](#safety-refusals))
 - `"aborted"` - Request was cancelled via abort signal
 
 `AssistantMessage` may also include `responseId`, a provider-specific upstream response or message identifier when the underlying API exposes one. Do not assume it is always present across providers.
@@ -571,9 +580,31 @@ if (message.stopReason === 'error' || message.stopReason === 'aborted') {
 }
 ```
 
+### Safety Refusals
+
+When a provider's safety system declines a request, the turn ends with `stopReason: "error"` and the message carries an optional `refusal` field (`{ category?: string; explanation?: string }`). Branch on the presence of `refusal`, not on the `errorMessage` text. Currently the Anthropic provider sets it for `stop_reason: "refusal"` (streaming safety classifiers) and for the proxy-emitted `"sensitive"` stop reason. `category` and `explanation` come from Anthropic's `stop_details` and are omitted when the API (or a proxy) does not supply them. The explanation is not stable text: display it, don't parse it.
+
+`errorMessage` always starts with `Request declined by the model's safety filter`, followed by the details when present:
+
+```
+Request declined by the model's safety filter (category: cyber): This request was declined because it could enable cyber harm.
+Request declined by the model's safety filter.
+```
+
+Re-sending the same context to the same model is normally declined again, so dreb never retries refusals automatically: `isContextOverflow()` returns `false` for them, the agent loop and coding-agent auto-retry skip them, and coding-agent does not run automatic compaction after them (which would resume the refused request). To continue, rephrase or remove the declined turn, or switch to a different model. Any partial output is kept on the message for display; errored assistant messages are not replayed to the provider.
+
+```typescript
+const message = await stream.result();
+if (message.refusal) {
+  console.warn(`Declined (${message.refusal.category ?? 'no category'}):`, message.refusal.explanation);
+}
+```
+
 ### Context Overflow
 
 Use `isContextOverflow(message, model.contextWindow)` to detect recognized provider context-limit errors or successful responses whose full input usage exceeds the configured window. The latter compares `usage.input + usage.cacheRead + usage.cacheWrite`; output tokens do not count toward that input-only check. A conservative registry window can be lower than the server's hard limit (for example, Copilot Opus 4.8 can accept requests above its configured 200K window). Detection does not raise the registry limit or modify the response.
+
+Requests rejected for their size in bytes count as overflow too, even when their token count is far below `contextWindow`. These include Anthropic's `413 request_too_large`, Amazon Bedrock's `Input is too long`, a LiteLLM proxy's `ContextWindowExceededError`, and a gateway's HTTP 413 with a standard reason phrase (`Request Entity Too Large`, `Payload Too Large`, or `Content Too Large`). Token-based checks cannot anticipate a byte cap, so recognizing the rejection is what lets a caller compact and retry. Rate-limit errors are not overflow, even when worded like one: per-minute token limits worded "Request too large" (Groq, OpenAI) and throttling errors such as Amazon Bedrock's "Too many tokens, please wait before trying again." both return `false`.
 
 ### Aborting Requests
 
@@ -1155,6 +1186,8 @@ const response = await complete(model, {
 **Azure OpenAI (Responses)**: Uses the Responses API only. Set `AZURE_OPENAI_API_KEY` and either `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME`. Use `AZURE_OPENAI_API_VERSION` (defaults to `v1`) to override the API version if needed. Deployment names are treated as model IDs by default, override with `azureDeploymentName` or `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` using comma-separated `model-id=deployment` pairs (for example `gpt-4o-mini=my-deployment,gpt-4o=prod`). Legacy deployment-based URLs are intentionally unsupported.
 
 **GitHub Copilot**: If you get "The requested model is not supported" error, enable the model manually in VS Code: open Copilot Chat, click the model selector, select the model (warning icon), and click "Enable".
+
+The Copilot OAuth provider also discovers the account's models: `login` and `refreshToken` read Copilot's `/models` and store the result as `credentials.models`, and `modifyModels()` applies it — hiding built-in Copilot models the account doesn't offer (or has disabled) and switching a model whose catalog endpoint isn't served to an advertised one (`/responses`, then `/chat/completions`). Capabilities still come from the catalog. Without discovered models, `modifyModels()` only rewrites `baseUrl`.
 
 **Google Gemini CLI / Antigravity**: These use Google Cloud OAuth. The `apiKey` returned by `getOAuthApiKey()` is a JSON string containing both the token and project ID, which the library handles automatically.
 

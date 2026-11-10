@@ -19,7 +19,7 @@ Edit directly or use `/settings` for common options.
 | `defaultModel` | string | - | Default model ID |
 | `defaultThinkingLevel` | string | - | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
-| `singleModelMode` | boolean | `false` | Force every subagent to run on the parent session's model — per-invocation overrides, per-agent model lists, agent-definition models, and the dispatch arbiter are bypassed, and any requested model selection is reported as a warning prepended to the child's output. See [agent-models.md](agent-models.md#single-model-mode) |
+| `singleModelMode` | boolean | `false` | Force every subagent to run on the parent session's model — per-invocation overrides, per-agent model lists, agent-definition models, and the dispatch arbiter are bypassed, and any requested model selection is reported as a warning just before the child's output. See [agent-models.md](agent-models.md#single-model-mode) |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 | `agentModels.models` | object | - | Per-agent model fallback lists for subagents (map of agent name → ordered model IDs). See [agent-models.md](agent-models.md) |
 | `modelSettings` | object | - | Per-model thinking-display and provider/model system-prompt overrides. See [modelSettings](#modelsettings) |
@@ -151,9 +151,11 @@ Prompt behavior:
 | `tabTitle.triggerAfter` | number | `9` | Number of tool calls before generating title |
 | `tabTitle.maxTitleLength` | number | `60` | Soft target length hint for generated titles (clamped to a hard cap of 300) |
 
-After the configured number of tool calls, dreb fires a single background LLM call to summarize the session's task into a terminal tab title, then sets it via OSC 0. The title is based primarily on your actual request and current-session actions, with branch/repo/cwd metadata used only for disambiguation. `maxTitleLength` is a soft target communicated to the model (default 60); titles may run a little longer for clarity and are hard-capped at 300 characters. The TUI truncates long titles visually while the dashboard shows the full name. Only fires once per session, and never overwrites an already-named (e.g. resumed) session. If the LLM call fails, the default title remains and the failure is surfaced (shown in interactive mode, logged to stderr in RPC mode).
+After the configured number of tool calls, dreb fires a single background LLM call to summarize the session's task into a terminal tab title, then sets it via OSC 0. The title is based primarily on your actual request and current-session actions, with branch/repo/cwd metadata used only for disambiguation. `maxTitleLength` is a soft target communicated to the model (default 60); titles may run a little longer for clarity and are hard-capped at 300 characters. The TUI truncates long titles visually while the dashboard shows the full name. Only fires once per session, and never overwrites an already-named (e.g. resumed) session. If the LLM call fails — including a provider error reported as an error stop reason — the default title remains and the failure is surfaced (shown in interactive mode, logged to stderr in RPC mode).
 
-`tabTitle.model` pins the primary call to one available exact model. Model IDs may contain `/`, so the first path segment is the provider and the complete remainder is the model ID. When this setting is absent, resolution is unchanged: the Explore `agentModels` override, then Explore agent frontmatter, then the parent session model. If the selected model call fails and differs from the parent session model, dreb retries once with the parent. Dashboard Settings exposes `enabled` and the exact model picker, including clearing a pinned model back to the automatic route; `triggerAfter` and `maxTitleLength` remain configurable in JSON.
+`tabTitle.model` pins the primary call to one available exact model. Model IDs may contain `/`, so the first path segment is the provider and the complete remainder is the model ID. When this setting is absent, resolution is unchanged: the Explore `agentModels` override, then Explore agent frontmatter, then the parent session model. If the selected model call fails and differs from the parent session model, dreb retries once with the parent. A pinned value that does not name a known model (for example a hand edit, or a model since removed from `models.json`) makes automatic titles use the parent model. Dashboard Settings exposes `enabled` and the exact model picker, including clearing a pinned model back to the automatic route; `triggerAfter` and `maxTitleLength` remain configurable in JSON.
+
+The same generator also powers **auto-generate** in the dashboard's [past-session rename modal](dashboard.md#renaming-past-sessions), which titles a saved session on request. That path follows `model` (with the same Explore route and parent retry, where the parent is the default model of the utility runtime that runs it) and `maxTitleLength`, re-reading settings and `models.json` from disk on each request so later changes apply. Because it is an explicit request, a pinned `model` that is not a known model fails with an error instead of falling back to the parent. `enabled` and `triggerAfter` only govern automatic titling, so they do not disable the button, and an explicitly requested title may replace an existing name once you confirm it.
 
 ```json
 {
@@ -249,6 +251,8 @@ The continuation option is intended for unattended long-running work and can pro
 | `retry.baseDelayMs` | number | `2000` | Base delay for exponential backoff (2s, 4s, 8s) |
 | `retry.maxDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
 
+Safety refusals (for example Anthropic `stop_reason: "refusal"`) are never retried automatically: re-sending the same context to the same model is normally declined again, so the turn fails with a `Request declined by the model's safety filter` error instead. For the same reason, automatic compaction does not run after a refused turn; the next prompt compacts first if needed. If a retried request is refused, the retry cycle ends with a failed `auto_retry_end`.
+
 When a provider requests a retry delay longer than `maxDelayMs` (e.g., Google's "quota will reset after 5h"), the request fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap.
 
 ```json
@@ -331,8 +335,7 @@ Only host-validated decision metadata is persisted/emitted. Raw arbiter prompts,
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `terminal.showImages` | boolean | `true` | Show images in terminal (if supported) |
-
-| `images.autoResize` | boolean | `true` | Resize images to 2000x2000 max |
+| `images.autoResize` | boolean | `true` | Resize images sent to the model to 2000x2000 max and under 4.5 MB of base64. A resized image is re-encoded as whichever of PNG or JPEG is smaller; images with transparency stay PNG when the PNG fits |
 | `images.blockImages` | boolean | `false` | Block all images from being sent to LLM |
 
 ### Shell
@@ -384,15 +387,27 @@ dreb includes two built-in layers of protection against accidental credential ex
 
 ### Sessions
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `sessionDir` | string | - | Directory where session files are stored. Accepts absolute or relative paths. |
+Main-session and subagent transcripts have separate storage roots:
+
+| Setting | Scope | Default | Description |
+|---------|-------|---------|-------------|
+| `sessionDir` | Global or project | Built-in nested per-project store | Flat directory for main-session JSONL files. |
+| `subagentSessionDir` | Global only | `<agent-dir>/subagent-sessions` | Root containing per-launch subagent directories. Project values are ignored. |
 
 ```json
-{ "sessionDir": ".dreb/sessions" }
+{
+  "sessionDir": "~/dreb/main-sessions",
+  "subagentSessionDir": "~/dreb/subagent-sessions"
+}
 ```
 
-When multiple sources specify a session directory, `--session-dir` CLI flag takes precedence, then `sessionDir` in settings.json, then extension hooks.
+For main CLI sessions, precedence is `--session-dir`, the effective merged settings value (project may override global), the `session_directory` extension hook, then the built-in store. A configured main root is flat: session JSONL files are written directly in that directory. RPC `list_all_sessions` uses that flat root when the active session manager was created with it; otherwise it retains built-in all-project discovery.
+
+Dashboard host-wide inventory is deliberately different: it reads only the global `sessionDir`, never a project override from the directory that launched Dashboard. It snapshots the value at server startup and either lists that flat directory or the built-in nested all-project tree. Restart Dashboard after changing it; an absolute global path is recommended.
+
+`subagentSessionDir` has no CLI flag and project settings cannot override it. Each AgentSession resolves the global value against its runtime cwd and uses it for new single, parallel, and chain child logs. If the configured root differs from the legacy `<agent-dir>/subagent-sessions` location, restart-time RPC rehydration scans the configured root first and the legacy root second, deduplicating canonical paths. This is discovery compatibility only: dreb does not move, copy, or delete old logs.
+
+Both settings accept the same path syntax: absolute paths stay absolute, `~` and `~/...` expand from the user home directory, and relative paths resolve against an explicit runtime base. That base is the main CLI cwd for CLI settings/flags/hooks, Dashboard's startup cwd for its global main inventory, and the AgentSession runtime cwd for `subagentSessionDir`. Empty or whitespace-only values are treated as unset. The footer / Dashboard daily cost ("today") sums today's transcripts from every root a session can see: the built-in nested store, the active session's flat root, the global and effective `sessionDir`, and both the configured and legacy subagent roots. Files reachable from more than one root are counted once. Sessions written to a project `sessionDir` that isn't visible from the current session are not counted. These roots affect transcripts only; they do not relocate credentials, `settings.json`, or other agent configuration.
 
 ### Model Cycling
 

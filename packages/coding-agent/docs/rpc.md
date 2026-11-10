@@ -33,7 +33,7 @@ historical field as a safe process-spawn path.
 
 ### Process exit and pipe errors
 
-`RpcClient.onExit(listener)` receives an `RpcExitInfo` when the child dies: `{ code, signal }` from a process `exit`, or `{ error }` from a spawn/runtime `error`. Process exits also carry `stderrTail` — the last **2000 characters** of the child's captured stderr — so a host that only watches for exit codes can still surface the child's own diagnostic (for example the stdout backpressure guard's abort message) instead of an opaque exit code. In-flight requests are rejected with the exit reason.
+`RpcClient.onExit(listener)` receives an `RpcExitInfo` when the child dies: `{ code, signal }` from a process `exit`, or `{ error }` from a spawn/runtime `error`. Process exits also carry `stderrTail` — the last **2000 characters** of the child's captured stderr — so a host that only watches for exit codes can still surface the child's own diagnostic (for example the stdout backpressure guard's abort message, or the `Fatal: stdout write failed (EPIPE|ENOBUFS|...)` diagnostic the child writes before exiting 1 when a stdout pipe write fails) instead of an opaque exit code. In-flight requests are rejected with the exit reason.
 
 Child stdio pipe failures (e.g. an `EPIPE` when writing a large prompt to a dying child) are handled the same way: each pipe's `error` event fails in-flight requests with the pipe error and the captured stderr tail instead of crashing the host process.
 
@@ -156,7 +156,9 @@ See [set_follow_up_mode](#set_follow_up_mode) for controlling how follow-up mess
 
 #### abort
 
-Abort the current agent operation.
+Abort the current agent operation. This also stops **every** running background agent of this session (like Esc in the TUI); to stop a single child, use [`abort_background_agent`](#abort_background_agent).
+
+Background agents are stopped gracefully: each child first receives an RPC `abort` so its own run (including any running tools — e.g. the bash tool kills its process group) unwinds, then it is terminated with SIGTERM, with a SIGKILL backstop if it is still alive. A child whose run had not started yet when it handled the abort (it was still booting or preparing its prompt) is sent the abort again as soon as that run starts, so it cannot run tools after the stop. A child that does not finish within a short grace period is terminated anyway. Stopped agents report `status: "cancelled"` and `background_agent_end` with `cancelled: true`.
 
 ```json
 {"type": "abort"}
@@ -333,7 +335,7 @@ Response:
 
 #### get_daily_cost
 
-Get the same-day aggregate cost across all session files. The RPC process scans once on first call so the first response is current, then returns the cached value (refreshed periodically by the tracker).
+Get the same-day aggregate cost across all session files, including sub-agent sessions. The RPC process scans once on first call so the first response is current, then returns the cached value (refreshed periodically by the tracker). Returns a breakdown of main session costs and sub-agent session costs.
 
 ```json
 {"type": "get_daily_cost"}
@@ -345,9 +347,15 @@ Response:
   "type": "response",
   "command": "get_daily_cost",
   "success": true,
-  "data": {"cost": 1.23}
+  "data": {"cost": 1.23, "main": 0.85, "subagent": 0.38}
 }
 ```
+
+- `cost` — total daily cost (main + subagent)
+- `main` — cost from main session files only
+- `subagent` — cost from sub-agent session files only
+
+Scans every storage root the session can see: the built-in store, custom `sessionDir` roots, and the configured and legacy `subagentSessionDir` roots. See [settings](settings.md#sessions).
 
 #### get_messages
 
@@ -508,7 +516,7 @@ Set the reasoning/thinking level for models that support it.
 
 Levels: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`
 
-Note: `"xhigh"` is supported by GPT-5.2 through GPT-5.6 model families, the GPT-6 family (Astra and future variants), Claude Opus 4.6–4.x and Claude 5 families (where it maps to adaptive effort `"max"`), and Kimi Code K3. The separate normalized `"max"` tier is model-aware and currently supported by GPT-5.6 aliases and Sol/Terra/Luna variants, plus the GPT-6 family.
+Note: `"xhigh"` is supported by GPT-5.2 through GPT-5.6 model families, the GPT-6 family (Astra and future variants), Claude Opus 4.7+, Sonnet 5+ and Haiku 5.5 on Anthropic, GitHub Copilot and Bedrock (sent as native effort `"xhigh"`), Claude Opus 4.6+ and Sonnet 5+ on OpenRouter, Kimi Code K3, and Qwen 3.8+. The separate normalized `"max"` tier is model-aware and currently supported by GPT-5.6 aliases and Sol/Terra/Luna variants, the GPT-6 family, and Claude Opus/Sonnet 4.6+ and Haiku 5.5 on Anthropic, GitHub Copilot and Bedrock. Unsupported levels are clamped (`xhigh` → `max` on Claude Opus/Sonnet 4.6, otherwise `high`; `max` → `xhigh` → `high`). `availableThinkingLevels` in `get_state` lists only the levels the current model supports and may omit `"off"`: Claude Opus 5.5 cannot turn thinking off, so its list starts at `"minimal"` and `set_thinking_level` with `"off"` lands on `"minimal"` (the saved default is left unchanged).
 
 Response:
 ```json
@@ -627,7 +635,7 @@ Response:
 
 #### set_auto_compaction
 
-Enable or disable automatic compaction when context is nearly full.
+Enable or disable automatic compaction: when context is nearly full, and compact-and-retry when a provider rejects a request as too large.
 
 ```json
 {"type": "set_auto_compaction", "enabled": true}
@@ -655,7 +663,7 @@ Response:
 
 #### set_auto_retry
 
-Enable or disable automatic retry on transient errors (overloaded, rate limit, 5xx).
+Enable or disable automatic retry on transient errors (overloaded, rate limit, 5xx). Safety refusals (assistant messages with a [`refusal`](#assistantmessage) field) are never treated as transient and are not retried.
 
 ```json
 {"type": "set_auto_retry", "enabled": true}
@@ -924,6 +932,31 @@ The path uses the same unrestricted, cross-project addressing as [`switch_sessio
 }
 ```
 
+#### generate_session_title
+
+Generate a title for a saved session file on request, using the same tab-title generator that names live sessions (see [Tab Title settings](settings.md#tab-title)). The session is not loaded or switched to, and the file is never modified: it is read once (old formats are migrated in memory only) and its current branch is used as the context. The command uses this process's `tabTitle.model` and `tabTitle.maxTitleLength` settings, Explore-agent `agentModels` routing, and current model as the parent fallback; `tabTitle.enabled` and `triggerAfter` do not apply. Global and project settings are reloaded from disk first (like `get_settings`), and so is `models.json` (like `get_available_models`), so changes saved by another process — including a newly added model that is then pinned — apply; a failed reload is an error response. Unlike automatic titling, which falls back to the parent model when `tabTitle.model` names an unknown model, this command fails. The title is returned, not saved — rename the session separately (for example with the dashboard's rename endpoint or `/name` after resuming).
+
+```json
+{"type": "generate_session_title", "sessionPath": "/path/to/session.jsonl"}
+```
+
+Response:
+```json
+{"type": "response", "command": "generate_session_title", "success": true, "data": {"title": "Fix login flow"}}
+```
+
+Generation is bounded at 60 seconds; `RpcClient.generateSessionTitle()` waits 90 seconds so the generator's own timeout error is returned. Every failure is an error response — an invalid path (not `.jsonl`, missing, not a regular file, or no session header), settings or `models.json` that cannot be reloaded, a session with no user requests or activity to title (its project directory alone is not titled), no available model, a pinned `tabTitle.model` that is not a known model, a provider error (with the parent-retry detail), or an empty reply:
+```json
+{
+  "type": "response",
+  "command": "generate_session_title",
+  "success": false,
+  "error": "Tab title generation failed with model anthropic/claude-haiku-4-5: 429 rate limited"
+}
+```
+
+Like [`delete_session`](#delete_session), the path is resolved without a sessions-directory containment guard.
+
 #### fork
 
 Create a new fork from any user or assistant message in the transcript. Can be cancelled by a `session_before_fork` extension event handler. For a **user** message the response `text` is that message's text (offered as editor pre-fill for re-asking) and the branch rewinds to before it; for an **assistant** message the branch *includes* that response (continue from that answer) and `text` is empty. Assistant turns that were interrupted (`error`/`aborted`) or are still waiting on tool results are not valid fork points and are rejected.
@@ -1007,10 +1040,16 @@ Returns `{"text": null}` if no assistant messages exist.
 
 #### set_session_name
 
-Set a display name for the current session. The name appears in session listings and helps identify sessions.
+Set a display name for the current session. The name appears in session listings and helps identify sessions. Empty or whitespace-only names are rejected.
 
 ```json
 {"type": "set_session_name", "name": "my-feature-work"}
+```
+
+The optional `sessionPath` makes the rename conditional: it applies only while that file (compared after path resolution) is the process's current session, and otherwise fails without changing anything. This lets a caller that looked up which process holds a session file rename it safely even if the process switches sessions (`new_session`, `switch_session`, an import) before the command arrives.
+
+```json
+{"type": "set_session_name", "name": "my-feature-work", "sessionPath": "/path/to/session.jsonl"}
 ```
 
 Response:
@@ -1019,6 +1058,16 @@ Response:
   "type": "response",
   "command": "set_session_name",
   "success": true
+}
+```
+
+When `sessionPath` no longer matches the current session:
+```json
+{
+  "type": "response",
+  "command": "set_session_name",
+  "success": false,
+  "error": "Session name not set: this runtime no longer holds /path/to/session.jsonl (its current session is /path/to/other.jsonl); try again"
 }
 ```
 
@@ -1108,7 +1157,7 @@ Each session has:
 
 #### list_all_sessions
 
-List sessions across all projects. Returns sessions sorted by most recently modified first. May be slow with many sessions. If the underlying listing fails (an I/O error reading the sessions store), the command responds `success: false` rather than a silently-empty list — so a client can distinguish "no sessions" from "listing failed."
+List the active main-session inventory, sorted by most recently modified first. For a session manager created with an explicit custom `sessionDir`, this reads JSONL files directly from that flat directory. Otherwise it preserves built-in all-project discovery across the nested `<agent-dir>/sessions` tree. The custom root is resolved by CLI precedence before RPC starts; no protocol field is added. If the underlying listing fails, the command responds `success: false` rather than a silently-empty list, so a client can distinguish "no sessions" from "listing failed."
 
 ```json
 {"type": "list_all_sessions"}
@@ -1143,7 +1192,7 @@ Each session has the same fields as `list_sessions`.
 
 #### list_background_agents
 
-List background subagents tracked by this process's registry — running and recently completed (finished entries are pruned after ~5 minutes). `sessionDir` is known from launch; `sessionFile` appears once the child process exits. Live transcripts are delivered via `background_agent_event` events (see Events), not by reading these paths.
+List background subagents tracked by this process's registry — running and recently completed (finished entries are pruned after ~5 minutes). `status` is `"running"`, `"completed"`, `"failed"` (the child errored), or `"cancelled"` (stopped by the user via `abort_background_agent`, `abort`, or Esc). A user stop is recorded as a `cancelled.json` marker in the agent's `sessionDir`. Rehydration reports such agents as `"cancelled"`, including chains stopped between steps, children terminated after the grace period, and agents stopped while queued or before spawning. Those last ones have no `sessionFile` and are recovered from the marker alone. A rehydrated child without a marker whose last assistant message was aborted is also reported as `"cancelled"`. `sessionDir` is the concrete per-launch directory under the global-only configured `subagentSessionDir` (or the legacy default); `sessionFile` appears once the child process exits. On a resumed parent, startup rehydration scans the configured write root first and the legacy `<agent-dir>/subagent-sessions` root second when different, skips absent roots, and deduplicates canonical paths. Files are not migrated. Live transcripts are delivered via `background_agent_event` events (see Events), not by reading these paths.
 
 ```json
 {"type": "list_background_agents"}
@@ -1188,6 +1237,21 @@ Read the selected live child's authoritative pending queues and effective steeri
 ```
 
 The response data is `{ "steeringMode": "one-at-a-time" | "all", "pending": RpcPendingMessages }`. Multiple `steer_background_agent` commands therefore use the target child's existing queue semantics.
+
+#### abort_background_agent
+
+Stop exactly one running background agent (a user stop — e.g. the dashboard subagent view's ■ stop). The parent's run, its queues, and sibling agents are untouched. Works for a child that is executing, waiting for a concurrency slot (it settles immediately without taking a slot), or between chain steps; a chain is stopped as a whole and no later step starts. The child is stopped gracefully as described under [`abort`](#abort).
+
+```json
+{"type":"abort_background_agent","agentId":"a1b2c3d4e5f6"}
+```
+
+Response:
+```json
+{"type": "response", "command": "abort_background_agent", "success": true}
+```
+
+The response confirms the stop was initiated; completion arrives as `background_agent_end` with `cancelled: true`, and the agent's status becomes `"cancelled"` immediately. The parent receives a `<background-agent-complete> … cancelled` message (with any partial output) in its context **without** a new parent turn — if it was the last running agent the parent stays idle until prompted. If the parent is busy, the message is held and appended once it is idle again. Busy means mid-run, still saving the run's last events, waiting on an auto-retry, or compacting. That way it never splits a tool call from its result or lands ahead of messages not yet saved. A held message is normally appended before the next prompt starts a turn. A prompt sent while the parent is still busy (for example during an auto-retry backoff) starts its turn first, and the message is appended when that turn ends. If the session is replaced first (new session, switch, or fork), the message is saved to the session it belongs to. Any steering still queued in the child is discarded with it. The command fails (`success: false`) for unknown agents and agents that are no longer running (completed, failed, already cancelled, or rehydrated); it never falls back to the parent or another child.
 
 #### list_agent_types
 
@@ -1586,7 +1650,7 @@ Valid keys and values:
 | `trustedContextFolders` | Replaces the global list atomically. Array of non-empty paths that expand to absolute, existing directories; each is canonicalized with native `realpath`, then deduplicated/subsumed. Relative, missing, non-directory, and broken-symlink entries are rejected. |
 | `transport` | `"sse"`, `"websocket"`, `"auto"` |
 | `hideThinkingBlock` | boolean |
-| `singleModelMode` | boolean; default `false`. When `true`, every subagent runs on the parent session's model — per-invocation overrides, per-agent model lists, agent-definition models, and the dispatch arbiter are bypassed, and any requested model selection is reported as a warning prepended to the child's output |
+| `singleModelMode` | boolean; default `false`. When `true`, every subagent runs on the parent session's model — per-invocation overrides, per-agent model lists, agent-definition models, and the dispatch arbiter are bypassed, and any requested model selection is reported as a warning just before the child's output |
 | `agentModels` | Plain object mapping agent names to arrays of non-empty model id strings; empty arrays remove the global entry for that agent |
 | `enabledModels` | Non-empty ordered array of available exact `provider/model` references, or explicit `null` to remove the global filter and restore implicit all. Duplicate, glob, fuzzy, and thinking-suffix entries are rejected. |
 | `subagentArbiter` | Complete global-only object or `null`. Keys: `enabled` boolean, exact available `model`, optional valid/capability-supported `thinking`, non-empty `guidePath`. Enabling requires `model`. Unknown nested keys are rejected. |
@@ -1790,7 +1854,7 @@ Response:
 | `auto_retry_start` | Auto-retry begins (after transient error) |
 | `auto_retry_end` | Auto-retry completes (success or final failure) |
 | `background_agent_start` | Background subagent launched (includes `sessionDir`) |
-| `background_agent_end` | Background subagent finished (canonical model/thinking, per-step chain metadata, and `sessionFile` when known) |
+| `background_agent_end` | Background subagent finished or was stopped (`cancelled`, canonical model/thinking, per-step chain metadata, and `sessionFile` when known) |
 | `background_agent_event` | Relayed event from a background subagent's own stream |
 | `parent_paused_for_background_agents` | Parent paused waiting on background agents |
 | `session_name_changed` | Session display name changed (manual rename, extension rename, or auto-title) |
@@ -1848,17 +1912,15 @@ Emitted when a message begins and completes. The `message` field contains an `Ag
 
 ### message_update (Streaming)
 
-Emitted during streaming of assistant messages. Contains both the partial message and a streaming delta event.
+Emitted during streaming of assistant messages. Carries a streaming delta event. By default, frames are **bounded**: they contain only the delta fields, never the cumulative message.
 
 ```json
 {
   "type": "message_update",
-  "message": {...},
   "assistantMessageEvent": {
     "type": "text_delta",
     "contentIndex": 0,
-    "delta": "Hello ",
-    "partial": {...}
+    "delta": "Hello "
   }
 }
 ```
@@ -1882,19 +1944,33 @@ The `assistantMessageEvent` field contains one of these delta types:
 
 Example streaming a text response:
 ```json
-{"type":"message_update","message":{...},"assistantMessageEvent":{"type":"text_start","contentIndex":0,"partial":{...}}}
-{"type":"message_update","message":{...},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello","partial":{...}}}
-{"type":"message_update","message":{...},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":" world","partial":{...}}}
-{"type":"message_update","message":{...},"assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"Hello world","partial":{...}}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":" world"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"Hello world"}}
 ```
 
-#### Dashboard-mode wire projection (`--ui dashboard`)
+#### Bounded wire projection (default)
 
-When the RPC server is launched with `--ui dashboard`, `message_update` events are projected **before serialization**: the cumulative top-level `message` field and the nested `assistantMessageEvent.partial` field are omitted from every frame. Both fields grow with the response, so carrying them on every delta makes the JSONL stream quadratic in response length; the dashboard reducer consumes only the delta fields (`type`, `contentIndex`, `delta`, `content`, `toolCall`), which are preserved unchanged.
+Every RPC server projects `message_update` events **before serialization**: the cumulative top-level `message` field and the nested `assistantMessageEvent.partial` field are omitted from every frame. Both fields grow with the response, so carrying them on every delta makes the JSONL stream quadratic in response length — long turns (especially large tool calls streamed as `toolcall_delta`) could flood the stdout pipe. The delta fields (`type`, `contentIndex`, `delta`, `content`, `toolCall`) are preserved unchanged, so total stdout volume stays proportional to response length.
 
-The projection applies recursively to `message_update` events nested inside `background_agent_event` payloads. It does **not** apply to command responses — `get_dashboard_snapshot` still returns complete messages — and `message_end` always carries the full final message as the authoritative transcript record. RPC servers launched without `--ui dashboard` emit the full unprojected protocol shown above.
+The projection applies recursively to `message_update` events nested inside `background_agent_event` payloads. It does **not** apply to command responses — `get_messages` and `get_dashboard_snapshot` still return complete messages — and `message_end` always carries the full final message as the authoritative transcript record.
 
-The same dashboard-mode projection also dedupes images across the wire. Inline `image` blocks (PNG, JPEG, GIF, WebP) are content-identified by `sha256(mimeType + 0x00 + decodedBytes)`; the first occurrence of each unique image is sent inline, and every later occurrence anywhere in the event stream is replaced with
+**Legacy full frames (opt-in).** Clients that still read `message` or `assistantMessageEvent.partial` from `message_update` can launch the server with `--rpc-full-message-updates` to restore the unprojected frames:
+
+```json
+{"type":"message_update","message":{...},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello","partial":{...}}}
+```
+
+The flag requires `--mode rpc` and is rejected with `--ui dashboard` (dashboard runtimes are always projected). A server started with the flag forwards it to the RPC-controlled subagent children it spawns, so nested `message_update` events relayed in `background_agent_event` payloads are full frames too. Prefer accumulating deltas or reading `message_end` instead.
+
+**TypeScript types.** `RpcEvent` (exported from the package and used by `RpcClient.onEvent`) types `message_update` as `RpcMessageUpdateEvent`: `message` and `assistantMessageEvent.partial` are optional, because they are absent unless the server runs with `--rpc-full-message-updates`.
+
+**Stdout write failures.** If a stdout write fails (`EPIPE` when the consumer has gone, `ENOBUFS`, ...), the server writes a `Fatal: stdout write failed (<code>: ...)` diagnostic to stderr and exits 1. A stdin close that arrives at the same time (a dying consumer usually closes both pipes) does not override this with a clean exit.
+
+#### Dashboard-mode image dedupe (`--ui dashboard`)
+
+Dashboard runtimes also dedupe images across the wire. Inline `image` blocks (PNG, JPEG, GIF, WebP) are content-identified by `sha256(mimeType + 0x00 + decodedBytes)`; the first occurrence of each unique image is sent inline, and every later occurrence anywhere in the event stream is replaced with
 
 ```json
 {"type": "image_reference", "id": "<64 hex chars>", "mimeType": "image/png", "size": 12345}
@@ -1949,13 +2025,13 @@ Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_upd
 
 ### auto_compaction_start / auto_compaction_end
 
-Emitted when automatic compaction runs (when context is nearly full).
+Emitted when automatic compaction runs: when context is nearly full, or when a provider rejects a request as too large.
 
 ```json
 {"type": "auto_compaction_start", "reason": "threshold"}
 ```
 
-The `reason` field is `"threshold"` (context getting large) or `"overflow"` (context exceeded limit).
+The `reason` field is `"threshold"` (context getting large) or `"overflow"` (the provider rejected the request as too large). An overflow can be a context-window error or a byte cap on the request body, such as a gateway's `413 Payload Too Large`, so it can happen with token counts far below the window. See [compaction.md](compaction.md#when-it-triggers).
 
 ```json
 {
@@ -1973,13 +2049,13 @@ The `reason` field is `"threshold"` (context getting large) or `"overflow"` (con
 
 `willRetry` is `true` whenever another model request is imminent after this event. That includes overflow recovery, resuming an interrupted assistant error, threshold compaction inside an active tool loop, and an active loop proceeding with intact context after mid-turn compaction is cancelled or fails. In-loop requests continue without calling `continue()`. Persistent `continueAfterAutoCompaction: true` can keep other pending work moving, but it does not restart a completed assistant answer with no queued input. Manual `compact` is outside this event path and does not continue because of that setting.
 
-If compaction was aborted, `result` is `null` and `aborted` is `true`. `willRetry` can still be `true` when the active agent loop will proceed without the compaction.
+If compaction was aborted, there is no `result` and `aborted` is `true`. `willRetry` can still be `true` when the active agent loop will proceed without the compaction.
 
-If compaction failed (e.g., API quota exceeded), `result` is `null`, `aborted` is `false`, and `errorMessage` contains the error description. As with cancellation, `willRetry` reflects whether the active loop will make another request.
+If compaction failed (e.g., API quota exceeded), or overflow recovery gave up because the compacted retry was rejected again, there is no `result`, `aborted` is `false`, and `errorMessage` contains the error description. As with cancellation, `willRetry` reflects whether the active loop will make another request.
 
 ### auto_retry_start / auto_retry_end
 
-Emitted when automatic retry is triggered after a transient error (overloaded, rate limit, 5xx).
+Emitted when automatic retry is triggered after a transient error (overloaded, rate limit, 5xx). A safety refusal never starts an automatic retry, whatever its error text says; see [AssistantMessage](#assistantmessage).
 
 ```json
 {
@@ -2009,11 +2085,13 @@ On final failure (max retries exceeded):
 }
 ```
 
+A retry cycle also ends with `success: false` when a retried request fails with an error that is not retried, such as a safety refusal. `attempt` is the number of retries made and `finalError` is that request's `errorMessage`. Like the max-retries failure, this `auto_retry_end` arrives after the failed request's `agent_end`.
+
 ### background_agent_start / subagent_arbitration / background_agent_end / background_agent_event
 
 Lifecycle, pre-spawn routing, and live-observability events for background subagents (the `subagent` tool's background mode).
 
-`background_agent_start` fires at launch. `sessionDir` is the directory the child will write its session JSONL into (per-launch, known before spawn):
+`background_agent_start` fires at launch. `sessionDir` is the actual directory the child will write its session JSONL into (per-launch, known before spawn). Its root is the AgentSession-startup snapshot of global-only `subagentSessionDir`; absolute/tilde/relative resolution is described in [Settings](settings.md#sessions):
 
 ```json
 {
@@ -2040,7 +2118,7 @@ When the global Dispatch Arbiter is enabled, `subagent_arbitration` fires after 
 
 The event is deliberately safe and programmatic: it never contains the task, guide, conversation context, prompt, raw response, or model reasoning. The parent session persists the same fields as a non-context `custom` entry. Consumers should update displayed background-agent identity from `final.agent` before child events arrive.
 
-`background_agent_end` fires after the result is delivered to the parent agent. For a single child it includes the canonical resolved `provider/model` and effective thinking level when reported; `sessionFile` is the child's session JSONL path when one was written:
+`background_agent_end` fires after the result is delivered to the parent agent. A cancellation that arrives while the parent is busy is queued for delivery, as described under [`abort_background_agent`](#abort_background_agent). `cancelled` is `true` when the user stopped the agent (`abort_background_agent`, `abort`, or Esc); `success` is `true` only for a clean, non-cancelled finish. For a single child it includes the canonical resolved `provider/model` and effective thinking level when reported; `sessionFile` is the child's session JSONL path when one was written:
 
 ```json
 {
@@ -2048,6 +2126,7 @@ The event is deliberately safe and programmatic: it never contains the task, gui
   "agentId": "a1b2c3d4e5f6",
   "agentType": "Explore",
   "success": true,
+  "cancelled": false,
   "model": "anthropic/claude-sonnet-4-20250514",
   "thinking": "medium",
   "sessionFile": "/home/user/.dreb/agent/subagent-sessions/a1b2c3d4e5f6/2026-07-07T12-00-00-000Z_uuid.jsonl"
@@ -2062,6 +2141,7 @@ Chain completions omit ambiguous scalar model/thinking fields and instead includ
   "agentId": "a1b2c3d4e5f6",
   "agentType": "Explore",
   "success": true,
+  "cancelled": false,
   "steps": [
     {"step": 1, "agent": "Explore", "success": true, "model": "anthropic/claude-sonnet-4-6", "thinking": "low"},
     {"step": 2, "agent": "feature-dev", "success": true, "model": "openai/gpt-5.6-sol", "thinking": "high"}
@@ -2445,6 +2525,25 @@ The `content` field can be a string or an array of `TextContent`/`ImageContent` 
 ```
 
 Stop reasons: `"stop"`, `"length"`, `"toolUse"`, `"error"`, `"aborted"`
+
+Messages that end with `"error"` or `"aborted"` also carry `errorMessage`. When the provider's safety system declined the request (currently Anthropic `stop_reason: "refusal"`, or a proxy's `"sensitive"`), the message ends with `"error"` and also has a `refusal` object with optional `category` and `explanation` taken from the provider. Use `refusal` to classify refusals instead of matching text. The `errorMessage` always starts with `Request declined by the model's safety filter`:
+
+```json
+{
+  "role": "assistant",
+  "content": [],
+  "api": "anthropic-messages",
+  "provider": "anthropic",
+  "model": "claude-opus-5-5",
+  "usage": {"input": 412, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 412, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+  "stopReason": "error",
+  "errorMessage": "Request declined by the model's safety filter (category: cyber): This request was declined because it could enable cyber harm.",
+  "refusal": {"category": "cyber", "explanation": "This request was declined because it could enable cyber harm."},
+  "timestamp": 1733234567890
+}
+```
+
+`category` and `explanation` are omitted when the provider does not supply them; the explanation is not stable text, so display it rather than parse it. Refusals are never retried automatically, because re-sending the same context to the same model is normally declined again. Rephrase or remove the declined turn, or switch models.
 
 ### ToolResultMessage
 

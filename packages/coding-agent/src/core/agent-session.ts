@@ -28,14 +28,14 @@ import type {
 } from "@dreb/agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@dreb/ai";
 import {
+	clampThinkingLevel,
+	getAvailableThinkingLevels,
 	isContextOverflow,
 	isOutputLimitExhaustion,
 	modelsAreEqual,
 	resetApiProviders,
-	supportsMax,
-	supportsXhigh,
 } from "@dreb/ai";
-import { getDocsPath } from "../config.js";
+import { getDocsPath, getSubagentSessionsDir } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { sleep } from "../utils/sleep.js";
 import { type BashResult, executeBash as executeBashCommand, executeBashWithOperations } from "./bash-executor.js";
@@ -124,6 +124,7 @@ import {
 	createAllToolDefinitions,
 	createSubagentConcurrencyGate,
 	discoverAgentTypes,
+	formatAgentOutputBlock,
 	getRunningBackgroundAgents,
 	type SessionTask,
 	type SubagentArbitrationEvent,
@@ -188,7 +189,10 @@ export type AgentSessionEvent =
 			type: "background_agent_end";
 			agentId: string;
 			agentType: string;
+			/** True only for a clean, non-cancelled finish (always false when `cancelled`). */
 			success: boolean;
+			/** True when the user stopped the agent (single-agent stop or stop-all). */
+			cancelled: boolean;
 			model?: string;
 			thinking?: ThinkingLevel;
 			steps?: SubagentStepMetadata[];
@@ -298,6 +302,7 @@ export interface SessionStats {
 		total: number;
 	};
 	cost: number;
+	subagentCost?: number;
 	contextUsage?: ContextUsage;
 }
 
@@ -310,14 +315,6 @@ interface ToolDefinitionEntry {
 // Constants
 // ============================================================================
 
-/** Standard thinking levels */
-const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
-
-/** Thinking levels including xhigh (for supported models). */
-const THINKING_LEVELS_WITH_XHIGH: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
-
-/** Complete ordered scale, including the native max tier for supported models. */
-const THINKING_LEVELS_WITH_MAX: ThinkingLevel[] = [...THINKING_LEVELS_WITH_XHIGH, "max"];
 const MIN_PERFORMANCE_DURATION_MS = 10;
 
 // ============================================================================
@@ -328,6 +325,10 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
+	/** Root used for all new subagent child-session writes in this session. */
+	readonly subagentSessionsDir: string;
+	/** Ordered restart-discovery roots: configured write root first, then legacy when different. */
+	readonly subagentSessionDiscoveryRoots: readonly string[];
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -335,6 +336,11 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _agentEventQueue: Promise<void> = Promise.resolve();
+	/**
+	 * Agent events queued on `_agentEventQueue` that haven't finished processing yet.
+	 * Persistence happens there, so the session log lags agent state until this is 0.
+	 */
+	private _agentEventsInFlight = 0;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: Array<{ text: string; images?: ImageContent[] }> = [];
@@ -361,9 +367,26 @@ export class AgentSession {
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 
+	// Context recovery state. A run that ends in an error can be followed by an automatic
+	// continuation: compact-and-retry after an overflow, a K3 context-tier upgrade, or a compaction
+	// that removed the trailing error. prompt() waits for it, as it does for an auto-retry.
+	private _recoveryPromise: Promise<void> | undefined = undefined;
+	private _recoveryResolve: (() => void) | undefined = undefined;
+	/** Count of scheduled automatic continuations, so agent_end processing can tell whether it scheduled one. */
+	private _automaticContinuations = 0;
+
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
+
+	/**
+	 * Background-agent cancellation notices that arrived while the parent was busy (see
+	 * `_canDeliverCancellationNotices`). Appending them then could land a user message
+	 * between an assistant tool call and its result, or ahead of messages not yet persisted.
+	 * They are held until the parent is idle again, or are persisted to their session before
+	 * it is replaced.
+	 */
+	private _pendingCancellationNotices: Message[] = [];
 
 	// Extension system
 	private _extensionRunner: ExtensionRunner | undefined = undefined;
@@ -460,6 +483,16 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		const legacySubagentSessionsDir = getSubagentSessionsDir();
+		this.subagentSessionsDir = getSubagentSessionsDir(this.settingsManager.getGlobalSubagentSessionDir(), this._cwd);
+		const comparableSubagentRoot = (path: string) => {
+			const resolved = resolve(path);
+			return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+		};
+		this.subagentSessionDiscoveryRoots =
+			comparableSubagentRoot(this.subagentSessionsDir) === comparableSubagentRoot(legacySubagentSessionsDir)
+				? [this.subagentSessionsDir]
+				: [this.subagentSessionsDir, legacySubagentSessionsDir];
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -947,11 +980,19 @@ export class AgentSession {
 		if (cancelled) {
 			parts.push("This agent was cancelled by the user.");
 		}
-		if (!cancelled && (result.exitCode !== 0 || result.errorMessage)) {
+		const failed = !cancelled && (result.exitCode !== 0 || !!result.errorMessage);
+		if (failed) {
 			parts.push(`Error: ${result.errorMessage || "unknown"}`);
 		}
+		if (result.notes && result.notes.length > 0) {
+			parts.push(...result.notes);
+		}
 		if (result.output) {
-			parts.push(result.output);
+			// The agent's own words are delimited from the system lines around them. A chain's
+			// output is already a per-step report with each step's output delimited
+			// (formatSingleResult), so it is not wrapped again.
+			const isChain = result.steps !== undefined;
+			parts.push(isChain ? result.output : formatAgentOutputBlock(result.output, cancelled || failed));
 		}
 		if (result.sessionFile) {
 			parts.push(`Session log: ${result.sessionFile}`);
@@ -975,13 +1016,15 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		if (cancelled) {
-			// Cancelled by user (Esc) — add to context and render in chat,
-			// but do NOT trigger a response (the user hit Esc to stop, not to ask a question)
+			// Cancelled by the user (single-agent stop, Esc, or the parent stop) — add to
+			// context and render in chat, but do NOT trigger a response: the user chose to
+			// stop this work, and waking the parent could relaunch it behind their back.
+			// While the parent is busy (streaming, still persisting the run, retrying, or
+			// compacting) the notice is deferred, so it can never split an assistant tool call
+			// from its result.
+			this._pendingCancellationNotices.push(message);
 			try {
-				this.agent.appendMessage(message);
-				this.sessionManager.appendMessage(message);
-				this._emit({ type: "message_start", message });
-				this._emit({ type: "message_end", message });
+				this._flushPendingCancellationNotices();
 			} catch (err) {
 				log.warn(
 					`[subagent] Failed to deliver cancellation message for agent ${agentId}: ${err instanceof Error ? err.message : String(err)}`,
@@ -997,6 +1040,8 @@ export class AgentSession {
 			if (this.agent.state.isStreaming) {
 				this.agent.steer(message);
 			} else {
+				// Earlier deferred cancellation notices precede this completion in context.
+				this._flushPendingCancellationNotices();
 				// Fallback: if streaming started between the isStreaming check and this call, deliver as follow-up
 				this.agent.prompt(message).catch((promptErr) => {
 					log.warn(
@@ -1018,7 +1063,8 @@ export class AgentSession {
 				type: "background_agent_end",
 				agentId,
 				agentType: result.agent,
-				success: result.exitCode === 0,
+				success: !cancelled && result.exitCode === 0,
+				cancelled,
 				model: result.model,
 				thinking: result.thinking,
 				steps: result.steps,
@@ -1047,13 +1093,15 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
-		// Create retry promise synchronously before queueing async processing.
-		// Agent.emit() calls this handler synchronously, and prompt() calls waitForRetry()
-		// as soon as agent.prompt() resolves. If _retryPromise is created only inside
-		// _processAgentEvent, slow earlier queued events can delay agent_end processing
-		// and waitForRetry() can miss the in-flight retry.
+		// Create the retry and recovery promises synchronously before queueing async processing.
+		// Agent.emit() calls this handler synchronously, and prompt() calls _waitForAutomaticFollowUps()
+		// as soon as agent.prompt() resolves. If they were created only inside _processAgentEvent, slow
+		// earlier queued events can delay agent_end processing and prompt() can miss the in-flight
+		// retry or context recovery.
 		this._createRetryPromiseForAgentEnd(event);
+		this._createRecoveryPromiseForAgentEnd(event);
 
+		this._agentEventsInFlight++;
 		this._agentEventQueue = this._agentEventQueue.then(
 			() => this._processAgentEvent(event),
 			() => {
@@ -1159,6 +1207,26 @@ export class AgentSession {
 		});
 	}
 
+	/**
+	 * Like the retry promise, created synchronously so prompt() cannot resolve between an error run's
+	 * agent_end and the automatic continuation that context recovery may schedule while processing it.
+	 * Resolved once a processed agent_end schedules no continuation, or when a continuation cannot start.
+	 */
+	private _createRecoveryPromiseForAgentEnd(event: AgentEvent): void {
+		if (event.type !== "agent_end" || this._recoveryPromise) {
+			return;
+		}
+
+		const lastAssistant = this._findLastAssistantInMessages(event.messages);
+		if (lastAssistant?.stopReason !== "error") {
+			return;
+		}
+
+		this._recoveryPromise = new Promise((resolve) => {
+			this._recoveryResolve = resolve;
+		});
+	}
+
 	private _findLastAssistantInMessages(messages: AgentMessage[]): AssistantMessage | undefined {
 		for (let i = messages.length - 1; i >= 0; i--) {
 			const message = messages[i];
@@ -1170,118 +1238,178 @@ export class AgentSession {
 	}
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
-		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
-		// This ensures the UI sees the updated queue state
-		if (event.type === "message_start" && event.message.role === "user") {
-			this._overflowRecoveryAttempted = false;
-			const messageText = this._getUserMessageText(event.message);
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.findIndex((message) => message.text === messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.findIndex((message) => message.text === messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
+		// The finally runs inline: an extra async wrapper here would add microtask hops to every
+		// queued event and delay event delivery relative to prompt() resolution.
+		const automaticContinuationsBefore = this._automaticContinuations;
+		try {
+			// When a user message starts, check if it's from either queue and remove it BEFORE emitting
+			// This ensures the UI sees the updated queue state
+			if (event.type === "message_start" && event.message.role === "user") {
+				this._overflowRecoveryAttempted = false;
+				const messageText = this._getUserMessageText(event.message);
+				if (messageText) {
+					// Check steering queue first
+					const steeringIndex = this._steeringMessages.findIndex((message) => message.text === messageText);
+					if (steeringIndex !== -1) {
+						this._steeringMessages.splice(steeringIndex, 1);
+					} else {
+						// Check follow-up queue
+						const followUpIndex = this._followUpMessages.findIndex((message) => message.text === messageText);
+						if (followUpIndex !== -1) {
+							this._followUpMessages.splice(followUpIndex, 1);
+						}
 					}
 				}
 			}
-		}
 
-		// Emit to extensions first
-		await this._emitExtensionEvent(event);
+			// Emit to extensions first
+			await this._emitExtensionEvent(event);
 
-		// Notify all listeners
-		this._emit(event);
+			// Notify all listeners
+			this._emit(event);
 
-		// Keep a small, mode-independent rolling context for the headless arbiter.
-		if (event.type === "message_end") {
-			this._dispatchArbiter.onMessageEnd(event.message);
-		} else if (event.type === "tool_execution_end") {
-			this._dispatchArbiter.onToolEnd({
-				toolName: event.toolName,
-				isError: event.isError,
-				result: event.result,
-			});
-		}
-
-		// Handle session persistence
-		if (event.type === "message_end") {
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+			// Keep a small, mode-independent rolling context for the headless arbiter.
+			if (event.type === "message_end") {
+				this._dispatchArbiter.onMessageEnd(event.message);
+			} else if (event.type === "tool_execution_end") {
+				this._dispatchArbiter.onToolEnd({
+					toolName: event.toolName,
+					isError: event.isError,
+					result: event.result,
+				});
 			}
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
-			// Track assistant message for auto-compaction (checked on agent_end)
-			if (event.message.role === "assistant") {
-				this._lastAssistantMessage = event.message;
-
-				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error") {
-					this._overflowRecoveryAttempted = false;
-				}
-
-				// Reset retry counter immediately on successful assistant response
-				// This prevents accumulation across multiple LLM calls within a turn
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
-					this._emit({
-						type: "auto_retry_end",
-						success: true,
-						attempt: this._retryAttempt,
-					});
-					this._retryAttempt = 0;
-				}
-
-				const durationMs = assistantMsg.durationMs ?? 0;
-				if (
-					assistantMsg.stopReason !== "error" &&
-					assistantMsg.stopReason !== "aborted" &&
-					assistantMsg.usage.output > 0 &&
-					durationMs >= MIN_PERFORMANCE_DURATION_MS
+			// Handle session persistence
+			if (event.type === "message_end") {
+				// Check if this is a custom message from extensions
+				if (event.message.role === "custom") {
+					// Persist as CustomMessageEntry
+					this.sessionManager.appendCustomMessageEntry(
+						event.message.customType,
+						event.message.content,
+						event.message.display,
+						event.message.details,
+					);
+				} else if (
+					event.message.role === "user" ||
+					event.message.role === "assistant" ||
+					event.message.role === "toolResult"
 				) {
-					this.performanceTracker.record({
-						timestamp: new Date().toISOString(),
-						sessionId: this.sessionId,
-						provider: assistantMsg.provider,
-						modelId: assistantMsg.model,
-						outputTokens: assistantMsg.usage.output,
-						durationMs,
-						tps: (assistantMsg.usage.output * 1000) / durationMs,
-					});
+					// Regular LLM message - persist as SessionMessageEntry
+					this.sessionManager.appendMessage(event.message);
+				}
+				// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+
+				// Track assistant message for auto-compaction (checked on agent_end)
+				if (event.message.role === "assistant") {
+					this._lastAssistantMessage = event.message;
+
+					const assistantMsg = event.message as AssistantMessage;
+					if (assistantMsg.stopReason !== "error") {
+						this._overflowRecoveryAttempted = false;
+					}
+
+					// Reset retry counter immediately on successful assistant response
+					// This prevents accumulation across multiple LLM calls within a turn
+					if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+						this._emit({
+							type: "auto_retry_end",
+							success: true,
+							attempt: this._retryAttempt,
+						});
+						this._retryAttempt = 0;
+					}
+
+					const durationMs = assistantMsg.durationMs ?? 0;
+					if (
+						assistantMsg.stopReason !== "error" &&
+						assistantMsg.stopReason !== "aborted" &&
+						assistantMsg.usage.output > 0 &&
+						durationMs >= MIN_PERFORMANCE_DURATION_MS
+					) {
+						this.performanceTracker.record({
+							timestamp: new Date().toISOString(),
+							sessionId: this.sessionId,
+							provider: assistantMsg.provider,
+							modelId: assistantMsg.model,
+							outputTokens: assistantMsg.usage.output,
+							durationMs,
+							tps: (assistantMsg.usage.output * 1000) / durationMs,
+						});
+					}
 				}
 			}
-		}
 
-		// Check auto-retry and auto-compaction after agent completes
-		if (event.type === "agent_end" && this._lastAssistantMessage) {
-			const msg = this._lastAssistantMessage;
-			this._lastAssistantMessage = undefined;
+			// Check auto-retry and auto-compaction after agent completes
+			if (event.type === "agent_end") {
+				if (this._lastAssistantMessage) {
+					const msg = this._lastAssistantMessage;
+					this._lastAssistantMessage = undefined;
 
-			// Check for retryable errors first (overloaded, rate limit, server errors)
-			if (this._isRetryableError(msg)) {
-				const didRetry = await this._handleRetryableError(msg);
-				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+					// Check for retryable errors first (overloaded, rate limit, server errors)
+					if (this._isRetryableError(msg)) {
+						const didRetry = await this._handleRetryableError(msg);
+						// Retry was initiated, don't proceed to compaction. Deferred cancellation
+						// notices stay held while the retry is pending (isRetrying) and are delivered
+						// after the retried run's agent_end.
+						if (didRetry) return;
+					}
+
+					// A retried request that ended in an error which is not retried (for example a
+					// safety refusal) still closes the retry cycle, so consumers tracking
+					// auto_retry_start do not wait for a retry that will never come.
+					if (this._retryAttempt > 0) {
+						this._emit({
+							type: "auto_retry_end",
+							success: false,
+							attempt: this._retryAttempt,
+							finalError: msg.errorMessage,
+						});
+						this._retryAttempt = 0;
+					}
+
+					this._resolveRetry();
+					await this._checkCompaction(msg);
+				}
+				// Deferred cancellation notices are delivered in the finally below once this
+				// agent_end has finished processing (after any retry decision or compaction above).
 			}
-
-			this._resolveRetry();
-			await this._checkCompaction(msg);
+		} finally {
+			this._agentEventsInFlight--;
+			// Context recovery ends at the first agent_end whose processing schedules no continuation,
+			// including one whose processing threw. A backoff retry is tracked by the retry promise.
+			if (event.type === "agent_end" && this._automaticContinuations === automaticContinuationsBefore) {
+				this._resolveRecovery();
+			}
+			// This event is handled and persisted. If the parent is now idle, deliver cancellation
+			// notices deferred while it was busy. After a run's final agent_end, that places them
+			// after everything the run persisted.
+			this._flushPendingCancellationNotices();
 		}
+	}
+
+	/** Resolve the pending context recovery promise */
+	private _resolveRecovery(): void {
+		if (this._recoveryResolve) {
+			this._recoveryResolve();
+			this._recoveryResolve = undefined;
+			this._recoveryPromise = undefined;
+		}
+	}
+
+	/**
+	 * Continue the agent after an automatic compaction or a K3 context-tier upgrade. During context
+	 * recovery, prompt() keeps waiting until the continued run's agent_end is processed; if the
+	 * continuation cannot start, recovery ends here.
+	 */
+	private _scheduleAutomaticContinuation(failurePrefix: string): void {
+		this._automaticContinuations++;
+		setTimeout(() => {
+			this.agent.continue().catch((err) => {
+				this._resolveRecovery();
+				this.warnInSession(`${failurePrefix}: ${err instanceof Error ? err.message : String(err)}`);
+			});
+		}, 100);
 	}
 
 	/** Resolve the pending retry promise */
@@ -1786,8 +1914,9 @@ export class AgentSession {
 			return;
 		}
 
-		// Flush any pending bash messages before the new prompt
+		// Flush any pending bash messages and cancellation notices before the new prompt
 		this._flushPendingBashMessages();
+		this._flushPendingCancellationNotices();
 
 		// Validate model
 		if (!this.model) {
@@ -1873,7 +2002,7 @@ export class AgentSession {
 		}
 
 		await this.agent.prompt(messages);
-		await this.waitForRetry();
+		await this._waitForAutomaticFollowUps();
 	}
 
 	/**
@@ -2180,6 +2309,8 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		// Like abortRetry(), release prompt() callers waiting for automatic context recovery.
+		this._resolveRecovery();
 		this.agent.abort();
 		await this.agent.waitForIdle();
 	}
@@ -2212,6 +2343,7 @@ export class AgentSession {
 
 		this._disconnectFromAgent();
 		await this.abort();
+		await this._persistPendingCancellationNoticesBeforeSessionChange();
 		this.agent.reset();
 		this._dispatchArbiter.clearContext();
 		this.sessionManager.newSession({ parentSession: options?.parentSession, cwd: this.cwd });
@@ -2421,8 +2553,7 @@ export class AgentSession {
 	 * Saves to session and settings only if the level actually changes.
 	 */
 	setThinkingLevel(level: ThinkingLevel): void {
-		const availableLevels = this.getAvailableThinkingLevels();
-		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+		const effectiveLevel = clampThinkingLevel(this.model, level);
 
 		// Only persist if actually changing
 		const isChanging = effectiveLevel !== this.agent.state.thinkingLevel;
@@ -2431,7 +2562,10 @@ export class AgentSession {
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
+			// A capability clamp (non-reasoning model, `off` on an always-thinking model,
+			// unsupported xhigh/max) must not overwrite the saved preference, so the next
+			// capable model can honor it again.
+			if (this.supportsThinking() && effectiveLevel === level) {
 				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 			}
 		}
@@ -2454,25 +2588,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * Get available thinking levels for current model.
-	 * The provider will clamp to what the specific model supports internally.
+	 * Get available thinking levels for current model, in ascending order.
+	 * `off` is omitted for models whose thinking cannot be turned off (Claude Opus 5.5+),
+	 * and `xhigh` / `max` are included independently per model capability.
 	 */
 	getAvailableThinkingLevels(): ThinkingLevel[] {
-		if (!this.supportsThinking()) return ["off"];
-		if (this.supportsMaxThinking()) return THINKING_LEVELS_WITH_MAX;
-		return this.supportsXhighThinking() ? THINKING_LEVELS_WITH_XHIGH : THINKING_LEVELS;
-	}
-
-	/**
-	 * Check if current model supports xhigh thinking level.
-	 */
-	supportsXhighThinking(): boolean {
-		return this.model ? supportsXhigh(this.model) : false;
-	}
-
-	/** Check if the current model supports the native max thinking level. */
-	supportsMaxThinking(): boolean {
-		return this.model ? supportsMax(this.model) : false;
+		return getAvailableThinkingLevels(this.model);
 	}
 
 	/**
@@ -2486,28 +2607,17 @@ export class AgentSession {
 		if (explicitLevel !== undefined) {
 			return explicitLevel;
 		}
+		const savedLevel = this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
 		if (!this.supportsThinking()) {
-			return this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+			return savedLevel;
+		}
+		// When the current level is only the capability clamp of the saved preference
+		// (e.g. saved `off` shown as `minimal` on Opus 5.5), carry the saved preference
+		// to the next model instead of the clamped value.
+		if (clampThinkingLevel(this.model, savedLevel) === this.thinkingLevel) {
+			return savedLevel;
 		}
 		return this.thinkingLevel;
-	}
-
-	private _clampThinkingLevel(level: ThinkingLevel, availableLevels: ThinkingLevel[]): ThinkingLevel {
-		const ordered = THINKING_LEVELS_WITH_MAX;
-		const available = new Set(availableLevels);
-		const requestedIndex = ordered.indexOf(level);
-		if (requestedIndex === -1) {
-			return availableLevels[0] ?? "off";
-		}
-		for (let i = requestedIndex; i < ordered.length; i++) {
-			const candidate = ordered[i];
-			if (available.has(candidate)) return candidate;
-		}
-		for (let i = requestedIndex - 1; i >= 0; i--) {
-			const candidate = ordered[i];
-			if (available.has(candidate)) return candidate;
-		}
-		return availableLevels[0] ?? "off";
 	}
 
 	// =========================================================================
@@ -2654,6 +2764,9 @@ export class AgentSession {
 		} finally {
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
+			// Cancellation notices that arrived while compacting were held back; deliver them
+			// now that the compacted context is in place.
+			this._flushPendingCancellationNotices();
 		}
 	}
 
@@ -2731,6 +2844,11 @@ export class AgentSession {
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return;
 
+		// A safety refusal is declined again on the same context, and compacting after it ends
+		// in an automatic continuation that re-sends the refused turn. Only compact once the
+		// user issues the next request (the pre-prompt check), which never auto-continues.
+		if (assistantMessage.refusal && !requestWillFollow) return;
+
 		let contextWindow = this.model?.contextWindow ?? 0;
 
 		// Skip overflow check if the message came from a different model.
@@ -2769,13 +2887,7 @@ export class AgentSession {
 				// for history, but we don't want it in context for the retry)
 				this._removeLastAssistantMessage();
 				if (!requestWillFollow) {
-					setTimeout(() => {
-						this.agent.continue().catch((err) => {
-							this.warnInSession(
-								`Agent failed to continue after context window upgrade: ${err instanceof Error ? err.message : String(err)}`,
-							);
-						});
-					}, 100);
+					this._scheduleAutomaticContinuation("Agent failed to continue after context window upgrade");
 				}
 				return;
 			}
@@ -3062,12 +3174,21 @@ export class AgentSession {
 
 			// Rebuilding from persisted entries can reintroduce the assistant error
 			// that triggered compaction. It is historical evidence, not valid retry
-			// context, regardless of how the compaction was classified.
+			// context, regardless of how the compaction was classified. Earlier errors
+			// from the same request come back too: an auto-retry removes each failed
+			// attempt from the context but keeps it in the session, so a retried request
+			// that was then rejected for its size ends in several errors. Drop them all,
+			// so the context ends where the failed request started, as before compaction.
 			let removedTrailingError = false;
 			const rebuiltMessages = this.agent.state.messages;
-			const rebuiltTail = rebuiltMessages[rebuiltMessages.length - 1];
-			if (rebuiltTail?.role === "assistant" && (rebuiltTail as AssistantMessage).stopReason === "error") {
-				this.agent.replaceMessages(rebuiltMessages.slice(0, -1));
+			let keptLength = rebuiltMessages.length;
+			while (keptLength > 0) {
+				const rebuiltTail = rebuiltMessages[keptLength - 1];
+				if (rebuiltTail.role !== "assistant" || (rebuiltTail as AssistantMessage).stopReason !== "error") break;
+				keptLength--;
+			}
+			if (keptLength < rebuiltMessages.length) {
+				this.agent.replaceMessages(rebuiltMessages.slice(0, keptLength));
 				removedTrailingError = true;
 			}
 
@@ -3087,14 +3208,7 @@ export class AgentSession {
 			this._emit({ type: "auto_compaction_end", result, aborted: false, willRetry: nextRequestWillFollow });
 
 			if (shouldContinue) {
-				setTimeout(() => {
-					this.agent.continue().catch((err) => {
-						// Agent failed to continue after auto-compaction — surface to session
-						this.warnInSession(
-							`Agent failed to continue after compaction: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					});
-				}, 100);
+				this._scheduleAutomaticContinuation("Agent failed to continue after compaction");
 			}
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
@@ -3471,6 +3585,7 @@ export class AgentSession {
 						},
 					},
 					subagent: {
+						subagentSessionsDir: this.subagentSessionsDir,
 						parentProvider: () => this.model?.provider,
 						parentModel: () => this.model?.id,
 						parentSessionFile: () => this.sessionFile,
@@ -3604,13 +3719,17 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
+		// Safety refusals are declined again on the same model and context, and their
+		// provider-supplied explanation is free text that could match the patterns below.
+		if (message.refusal) return false;
+
 		// Context overflow is handled by compaction, not retry
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		const err = message.errorMessage;
-		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors, fetch failed, terminated, retry delay exceeded
-		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|other side closed|fetch failed|ended without|upstream.?connect|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay/i.test(
+		// Match: overloaded_error, provider returned error, rate limit, 429, throttling (Bedrock: "Too many tokens, please wait before trying again."), 500, 502, 503, 504, service unavailable, network/connection errors, fetch failed, terminated, retry delay exceeded
+		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|throttl|wait before trying again|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|other side closed|fetch failed|ended without|upstream.?connect|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay/i.test(
 			err,
 		);
 	}
@@ -3645,7 +3764,7 @@ export class AgentSession {
 				finalError: message.errorMessage,
 			});
 			this._retryAttempt = 0;
-			this._resolveRetry(); // Resolve so waitForRetry() completes
+			this._resolveRetry(); // Resolve so prompt() stops waiting for the retry
 			return false;
 		}
 
@@ -3706,12 +3825,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Wait for any in-progress retry to complete.
-	 * Returns immediately if no retry is in progress.
+	 * Wait until the session stops continuing on its own: an in-progress auto-retry (its backoff and the
+	 * retried run) and automatic context recovery (compact-and-retry after an overflow, and the continued
+	 * run). Either can lead to the other, so wait until neither is pending.
+	 * Returns immediately if neither is in progress.
 	 */
-	private async waitForRetry(): Promise<void> {
-		if (this._retryPromise) {
-			await this._retryPromise;
+	private async _waitForAutomaticFollowUps(): Promise<void> {
+		for (;;) {
+			const pending = this._retryPromise ?? this._recoveryPromise;
+			if (!pending) return;
+			await pending;
 		}
 	}
 
@@ -3821,6 +3944,62 @@ export class AgentSession {
 	}
 
 	/**
+	 * Whether deferred cancellation notices can be appended now without landing inside
+	 * work that is still changing the transcript. Not while the agent streams, while
+	 * earlier agent events are still being processed or persisted (the session log would
+	 * get the notice ahead of them), while an auto-retry is pending (its backoff or the
+	 * retried run), or while compaction or branch summarization runs.
+	 */
+	private _canDeliverCancellationNotices(): boolean {
+		return !this.agent.state.isStreaming && this._agentEventsInFlight === 0 && !this.isRetrying && !this.isCompacting;
+	}
+
+	/**
+	 * Append deferred background-agent cancellation notices to agent state and the session
+	 * log, in arrival order, and render them, if the parent is idle (see
+	 * `_canDeliverCancellationNotices`). Otherwise they stay queued. They are retried after
+	 * each processed agent event (`_processAgentEvent`), before the next prompt, and after manual compaction or
+	 * branch navigation. Never triggers a response.
+	 */
+	private _flushPendingCancellationNotices(): void {
+		if (this._pendingCancellationNotices.length === 0 || !this._canDeliverCancellationNotices()) return;
+		this._appendPendingCancellationNotices();
+	}
+
+	private _appendPendingCancellationNotices(): void {
+		while (this._pendingCancellationNotices.length > 0) {
+			const message = this._pendingCancellationNotices.shift()!;
+			this.agent.appendMessage(message);
+			this.sessionManager.appendMessage(message);
+			this._emit({ type: "message_start", message });
+			this._emit({ type: "message_end", message });
+		}
+	}
+
+	/**
+	 * Persist cancellation notices still deferred for the current session before it is replaced
+	 * (new session, resume/switch, fork). The run they wait on will never end in this
+	 * session, so they are written now instead of being dropped. First every event that session
+	 * already produced is processed, so the notices land after the last message it persisted.
+	 *
+	 * Callers that abort the run first (new session, switch) get a normal append to agent state
+	 * and the log. A fork keeps the run going, so if it is still streaming the notices are only
+	 * written to the outgoing session's log. Live context is rebuilt from the fork, and must
+	 * not get a user message between a tool call and its result.
+	 */
+	private async _persistPendingCancellationNoticesBeforeSessionChange(): Promise<void> {
+		if (this._pendingCancellationNotices.length === 0) return;
+		await this._agentEventQueue.catch(() => undefined);
+		if (this.agent.state.isStreaming) {
+			for (const message of this._pendingCancellationNotices.splice(0)) {
+				this.sessionManager.appendMessage(message);
+			}
+			return;
+		}
+		this._appendPendingCancellationNotices();
+	}
+
+	/**
 	 * Flush pending bash messages to agent state and session.
 	 * Called after agent turn completes to maintain proper message ordering.
 	 */
@@ -3880,6 +4059,7 @@ export class AgentSession {
 
 		this._disconnectFromAgent();
 		await this.abort();
+		await this._persistPendingCancellationNoticesBeforeSessionChange();
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this._pendingNextTurnMessages = [];
@@ -3920,10 +4100,7 @@ export class AgentSession {
 			// Restore thinking level if saved (setThinkingLevel clamps to model capabilities)
 			this.setThinkingLevel(sessionContext.thinkingLevel as ThinkingLevel);
 		} else {
-			const availableLevels = this.getAvailableThinkingLevels();
-			const effectiveLevel = availableLevels.includes(defaultThinkingLevel)
-				? defaultThinkingLevel
-				: this._clampThinkingLevel(defaultThinkingLevel, availableLevels);
+			const effectiveLevel = clampThinkingLevel(this.model, defaultThinkingLevel);
 			this.agent.setThinkingLevel(effectiveLevel);
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
 		}
@@ -4039,6 +4216,9 @@ export class AgentSession {
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
+
+		// Cancellation notices belong to the outgoing session: persist them there.
+		await this._persistPendingCancellationNoticesBeforeSessionChange();
 
 		// Clear pending messages (bound to old session state)
 		this._pendingNextTurnMessages = [];
@@ -4295,6 +4475,8 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
 			this._branchSummaryAbortController = undefined;
+			// Deliver cancellation notices held back while the branch summary was generated.
+			this._flushPendingCancellationNotices();
 		}
 	}
 

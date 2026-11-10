@@ -7,6 +7,8 @@ import { describe, expect, it } from "vitest";
 import type { Api, Context, Model, StreamOptions, Tool, ToolResultMessage } from "../src/index.js";
 import { complete, getModel } from "../src/index.js";
 import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.js";
+import { getCopilotTestModel } from "./fixtures/copilot-models.js";
+import { isLiveApiEnabled } from "./live-api.js";
 import { applyCopilotBaseUrl, resolveApiKey } from "./oauth.js";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
@@ -150,18 +152,15 @@ async function verifyToolResultImagesStayInFunctionCallOutput<TApi extends Api>(
 }
 
 describe("Responses API tool result images", () => {
-	describe.skipIf(process.env.DREB_SKIP_LIVE_API === "1" || !process.env.OPENAI_API_KEY)(
-		"OpenAI Responses Provider (gpt-5-mini)",
-		() => {
-			const model = getModel("openai", "gpt-5-mini");
+	describe.skipIf(!isLiveApiEnabled() || !process.env.OPENAI_API_KEY)("OpenAI Responses Provider (gpt-5-mini)", () => {
+		const model = getModel("openai", "gpt-5-mini");
 
-			it("should send tool result images in function_call_output", { retry: 3, timeout: 30000 }, async () => {
-				await verifyToolResultImagesStayInFunctionCallOutput(model, { reasoningEffort: "low" });
-			});
-		},
-	);
+		it("should send tool result images in function_call_output", { retry: 3, timeout: 30000 }, async () => {
+			await verifyToolResultImagesStayInFunctionCallOutput(model, { reasoningEffort: "low" });
+		});
+	});
 
-	describe.skipIf(process.env.DREB_SKIP_LIVE_API === "1" || !hasAzureOpenAICredentials())(
+	describe.skipIf(!isLiveApiEnabled() || !hasAzureOpenAICredentials())(
 		"Azure OpenAI Responses Provider (gpt-4o-mini)",
 		() => {
 			const model = getModel("azure-openai-responses", "gpt-4o-mini");
@@ -174,10 +173,10 @@ describe("Responses API tool result images", () => {
 		},
 	);
 
-	describe("GitHub Copilot Responses Provider (gpt-5.4)", () => {
-		const model = applyCopilotBaseUrl(getModel("github-copilot", "gpt-5.4"), githubCopilotToken);
+	describe("GitHub Copilot Responses Provider (reasoning and image capable)", () => {
+		const model = applyCopilotBaseUrl(getCopilotTestModel("openai-responses"), githubCopilotToken);
 
-		it.skipIf(process.env.DREB_SKIP_LIVE_API === "1" || !githubCopilotToken)(
+		it.skipIf(!isLiveApiEnabled() || !githubCopilotToken)(
 			"should send tool result images in function_call_output",
 			{ retry: 3, timeout: 30000 },
 			async () => {
@@ -192,7 +191,7 @@ describe("Responses API tool result images", () => {
 	describe("OpenAI Codex Responses Provider (gpt-5.6-luna)", () => {
 		const model = getModel("openai-codex", "gpt-5.6-luna");
 
-		it.skipIf(process.env.DREB_SKIP_LIVE_API === "1" || !openaiCodexToken)(
+		it.skipIf(!isLiveApiEnabled() || !openaiCodexToken)(
 			"should send tool result images in function_call_output",
 			{ retry: 3, timeout: 30000 },
 			async () => {

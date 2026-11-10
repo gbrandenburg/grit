@@ -67,6 +67,7 @@ export function makeFakeClient() {
 			totalMessages: 2,
 			tokens: { input: 1200, output: 300, cacheRead: 40, cacheWrite: 5, total: 1545 },
 			cost: 0.42,
+			subagentCost: 0.17,
 		})),
 		getPerformanceStats: vi.fn(async () => ({
 			models: [
@@ -101,7 +102,7 @@ export function makeFakeClient() {
 			{ name: "buddy", description: "Toggle buddy mode", source: "builtin", dashboard: false },
 		]),
 		getGitBranch: vi.fn(async () => "feature/test"),
-		getDailyCost: vi.fn(async () => 1.23),
+		getDailyCost: vi.fn(async () => ({ cost: 1.23, main: 1.0, subagent: 0.23 })),
 		getAvailableModels: vi.fn(async () => [
 			{ provider: "test", id: "m1", name: "Test Model", contextWindow: 200000, reasoning: false },
 		]),
@@ -192,9 +193,12 @@ export function makeFakeClient() {
 		fork: vi.fn(async () => ({ text: "", cancelled: false })),
 		listSessions: vi.fn(async () => []),
 		switchSession: vi.fn(async () => ({ cancelled: false })),
+		setSessionName: vi.fn(async (_name: string, _options?: { sessionPath?: string }) => {}),
+		generateSessionTitle: vi.fn(async (_sessionPath: string) => ({ title: "Generated title" })),
 		prompt: vi.fn(async () => {}),
 		steer: vi.fn(async () => {}),
 		followUp: vi.fn(async () => {}),
+		abortBackgroundAgent: vi.fn(async (_agentId: string) => {}),
 		abortCompaction: vi.fn(async () => {}),
 		abortRetry: vi.fn(async () => {}),
 		emit: (event: Record<string, unknown>) => emitter.emit("event", event),
@@ -442,6 +446,100 @@ describe("RuntimePool", () => {
 		expect(clients[0].stop).toHaveBeenCalled();
 		expect(pool.list()).toHaveLength(0);
 		expect(await pool.stop(handle.key)).toBe(false);
+	});
+
+	it("findBySessionFile() matches each runtime's authoritative session file after resolve()", async () => {
+		const { pool, clients } = makePool();
+		await pool.create("/tmp/a");
+		const owner = await pool.create("/tmp/b", "/sessions/resumed.jsonl");
+		const baseState = await clients[1].getState();
+		// The runtime moved on from its resume path; only its current file is owned.
+		vi.mocked(clients[1].getState).mockResolvedValue({
+			...baseState,
+			sessionFile: "/sessions/sub/../current.jsonl",
+		} as any);
+
+		await expect(pool.findBySessionFile("/sessions/current.jsonl")).resolves.toBe(owner);
+		await expect(pool.findBySessionFile("/sessions/resumed.jsonl")).resolves.toBeUndefined();
+		await expect(pool.findBySessionFile("/sessions/other.jsonl")).resolves.toBeUndefined();
+	});
+
+	it("findBySessionFile() uses the last known session file when a runtime cannot answer", async () => {
+		const { pool, clients } = makePool();
+		const owner = await pool.create("/tmp/a", "/sessions/resumed.jsonl");
+		vi.mocked(clients[0].getState).mockRejectedValue(new Error("RPC process not running"));
+
+		await expect(pool.findBySessionFile("/sessions/resumed.jsonl")).resolves.toBe(owner);
+	});
+
+	it("findBySessionFile() waits for a runtime still resuming the file and returns it", async () => {
+		const start = deferred<void>();
+		const clients: Array<ReturnType<typeof makeFakeClient>> = [];
+		const pool = new RuntimePool({
+			cliPath: "/fake/cli.js",
+			clientFactory: () => {
+				const client = makeFakeClient();
+				vi.mocked(client.start).mockReturnValue(start.promise);
+				vi.mocked(client.getState).mockResolvedValue({ sessionFile: "/sessions/one.jsonl" } as any);
+				clients.push(client);
+				return client;
+			},
+		});
+		// The child was spawned with --session and has loaded the file, but is not listed yet.
+		const resuming = pool.create("/tmp/a", "/sessions/one.jsonl");
+		let settled = false;
+		const lookup = pool.findBySessionFile("/sessions/sub/../one.jsonl").finally(() => {
+			settled = true;
+		});
+
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(settled).toBe(false);
+		start.resolve();
+
+		const owner = await resuming;
+		await expect(lookup).resolves.toBe(owner);
+	});
+
+	it("findBySessionFile() does not wait for a runtime resuming a different file", async () => {
+		const start = deferred<void>();
+		const pool = new RuntimePool({
+			cliPath: "/fake/cli.js",
+			clientFactory: () => {
+				const client = makeFakeClient();
+				vi.mocked(client.start).mockReturnValue(start.promise);
+				return client;
+			},
+		});
+		const resuming = pool.create("/tmp/a", "/sessions/other.jsonl");
+
+		await expect(pool.findBySessionFile("/sessions/one.jsonl")).resolves.toBeUndefined();
+		start.resolve();
+		await resuming;
+	});
+
+	it("findBySessionFile() looks again when a runtime is listed during the state round trip", async () => {
+		const { pool, clients } = makePool();
+		await pool.create("/tmp/slow");
+		const slowState = deferred<unknown>();
+		vi.mocked(clients[0].getState).mockReturnValue(slowState.promise as any);
+
+		const lookup = pool.findBySessionFile("/sessions/one.jsonl");
+		// While the first runtime is still answering, another resumes the file and finishes starting.
+		const owner = await pool.create("/tmp/fast", "/sessions/one.jsonl");
+		vi.mocked(clients[1].getState).mockResolvedValue({ sessionFile: "/sessions/one.jsonl" } as any);
+		slowState.resolve({ sessionFile: "/sessions/elsewhere.jsonl" });
+
+		await expect(lookup).resolves.toBe(owner);
+	});
+
+	it("findBySessionFile() never returns a utility runtime", async () => {
+		const { pool, clients } = makePool();
+		await pool.ensureUtilityRuntime("/tmp/utility");
+		const baseState = await clients[0].getState();
+		vi.mocked(clients[0].getState).mockResolvedValue({ ...baseState, sessionFile: "/sessions/one.jsonl" } as any);
+
+		await expect(pool.findBySessionFile("/sessions/one.jsonl")).resolves.toBeUndefined();
+		expect(clients[0].getState).toHaveBeenCalledTimes(1);
 	});
 
 	it("stopAll() stops session runtimes and utility runtimes", async () => {
@@ -904,6 +1002,19 @@ describe("RuntimePool", () => {
 		expect(handle.backgroundAgents.get("bg1")?.sessionFile).toBe("/s/bg1.jsonl");
 	});
 
+	it("records a user-stopped background agent as cancelled, not failed", async () => {
+		const { pool, clients } = makePool();
+		const handle = await pool.create("/tmp");
+		clients[0].emit({ type: "background_agent_start", agentId: "stopped", agentType: "Explore", taskSummary: "t" });
+		clients[0].emit({ type: "background_agent_start", agentId: "crashed", agentType: "Explore", taskSummary: "t" });
+
+		clients[0].emit({ type: "background_agent_end", agentId: "stopped", success: false, cancelled: true });
+		clients[0].emit({ type: "background_agent_end", agentId: "crashed", success: false, cancelled: false });
+
+		expect(handle.backgroundAgents.get("stopped")?.status).toBe("cancelled");
+		expect(handle.backgroundAgents.get("crashed")?.status).toBe("failed");
+	});
+
 	it("projects failed arbitration records without replacing the requested identity", async () => {
 		const { pool, clients } = makePool();
 		const handle = await pool.create("/tmp");
@@ -993,7 +1104,7 @@ describe("RuntimePool", () => {
 		expect(info.cwd).toBe("/tmp");
 		expect(info.needsAttention).toBe(true);
 		expect(info.state.sessionId).toBe("s1");
-		expect(info.stats).toEqual({ tokensTotal: 1545, cost: 0.42 });
+		expect(info.stats).toEqual({ tokensTotal: 1545, cost: 0.42, subagentCost: 0.17 });
 		expect(info.lastAssistantText).toBe("last assistant activity preview");
 	});
 

@@ -16,7 +16,7 @@ import { createServer as createHttpServer, type Server as HttpServer } from "nod
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { APP_NAME, getAgentDir } from "@dreb/coding-agent";
+import { APP_NAME, getAgentDir, resolveConfiguredDirectory, SessionManager, SettingsManager } from "@dreb/coding-agent";
 import { DashboardAuth } from "./server/auth.js";
 import { DashboardImageService } from "./server/dashboard-images.js";
 import { ImagePreviewWorker } from "./server/image-preview.js";
@@ -35,6 +35,29 @@ export { createDashboardServer, parseDeviceCookie } from "./server/server.js";
 export type * from "./shared/protocol.js";
 
 const DEFAULT_PORT = 5343;
+
+/** Select Dashboard's host-wide main-session root from global settings only. */
+export function resolveDashboardSessionInventoryRoot(
+	settingsManager: Pick<SettingsManager, "getGlobalSettings">,
+	startupCwd: string,
+): string | undefined {
+	return resolveConfiguredDirectory(settingsManager.getGlobalSettings().sessionDir, startupCwd);
+}
+
+interface DashboardSessionInventory<T> {
+	listAllMetadata(): Promise<T[]>;
+	listAllMetadataFromDir(dir: string): Promise<T[]>;
+}
+
+/** Build the startup-snapshotted inventory reader used by the Dashboard server. */
+export function createDashboardSessionLister<T>(
+	customDir: string | undefined,
+	inventory: DashboardSessionInventory<T>,
+): () => Promise<T[]> {
+	return customDir !== undefined
+		? () => inventory.listAllMetadataFromDir(customDir)
+		: () => inventory.listAllMetadata();
+}
 
 interface CliArgs {
 	port: number;
@@ -269,6 +292,14 @@ async function main(): Promise<void> {
 		return;
 	}
 
+	const startupCwd = process.cwd();
+	const settingsManager = SettingsManager.create(startupCwd);
+	for (const { scope, error } of settingsManager.drainErrors()) {
+		if (scope === "global") console.warn(`[dashboard] Could not read global settings: ${error.message}`);
+	}
+	const customSessionInventoryRoot = resolveDashboardSessionInventoryRoot(settingsManager, startupCwd);
+	const listAllSessions = createDashboardSessionLister(customSessionInventoryRoot, SessionManager);
+
 	const agentDir = getAgentDir();
 	const auth = new DashboardAuth({
 		remoteEnabled: args.remote,
@@ -313,7 +344,6 @@ async function main(): Promise<void> {
 	});
 	const onRestart = () => beginShutdown("restart requested — exiting for supervisor to respawn", 1);
 
-	const { SessionManager } = await import("@dreb/coding-agent");
 	const app = createDashboardServer({
 		auth,
 		pool,
@@ -321,11 +351,16 @@ async function main(): Promise<void> {
 		staticDir: existsSync(staticDir) ? staticDir : undefined,
 		serverVersion,
 		onRestart,
-		listAllSessions: () => SessionManager.listAll(),
+		listAllSessions,
 		deleteSession: async (path: string) => {
 			const result = await SessionManager.deleteSession(path, {});
 			if (!result.ok) throw new Error(result.error ?? "Unknown deletion error");
 			return { method: result.method };
+		},
+		renameSession: async (path: string, name: string) => {
+			const result = SessionManager.renameSession(path, name);
+			if (!result.ok) throw new Error(result.error);
+			return { name: result.name };
 		},
 	});
 	closeDashboard = () => app.closeDashboard();

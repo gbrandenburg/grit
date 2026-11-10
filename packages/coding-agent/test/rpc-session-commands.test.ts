@@ -6,7 +6,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { RpcClient } from "../src/modes/rpc/rpc-client.js";
-import { deleteSessionForRpc, listAllSessionsForRpc, toRpcSessionInfo } from "../src/modes/rpc/rpc-mode.js";
+import {
+	deleteSessionForRpc,
+	listAllSessionsForRpc,
+	setSessionNameForRpc,
+	toRpcSessionInfo,
+} from "../src/modes/rpc/rpc-mode.js";
 import type { RpcSessionInfo } from "../src/modes/rpc/rpc-types.js";
 
 const tempDirs: string[] = [];
@@ -84,6 +89,23 @@ describe("RPC session commands", () => {
 			type: "get_background_agent_pending",
 			agentId: "agent-1",
 		});
+	});
+
+	it("serializes a single-agent stop and rejects failed stop responses", async () => {
+		const client = new RpcClient() as any;
+		client.send = vi
+			.fn()
+			.mockResolvedValueOnce({ type: "response", command: "abort_background_agent", success: true })
+			.mockResolvedValueOnce({
+				type: "response",
+				command: "abort_background_agent",
+				success: false,
+				error: 'Background agent "agent-1" is no longer running.',
+			});
+
+		await client.abortBackgroundAgent("agent-1");
+		expect(client.send).toHaveBeenNthCalledWith(1, { type: "abort_background_agent", agentId: "agent-1" });
+		await expect(client.abortBackgroundAgent("agent-1")).rejects.toThrow("is no longer running");
 	});
 
 	it("rejects failed agent-scoped steering responses", async () => {
@@ -165,6 +187,122 @@ describe("RPC session commands", () => {
 
 		await expect(client.listAllSessions()).rejects.toThrow("Unable to list sessions");
 	});
+
+	it("RpcClient.generateSessionTitle waits past the runtime's 60 s bound and unwraps the title", async () => {
+		const client = new RpcClient() as any;
+		client.send = vi.fn().mockResolvedValue({
+			type: "response",
+			command: "generate_session_title",
+			success: true,
+			data: { title: "Fix login bug" },
+		});
+
+		await expect(client.generateSessionTitle("/sessions/one.jsonl")).resolves.toEqual({ title: "Fix login bug" });
+		expect(client.send).toHaveBeenCalledWith(
+			{ type: "generate_session_title", sessionPath: "/sessions/one.jsonl" },
+			90_000,
+		);
+	});
+
+	it("RpcClient.generateSessionTitle rejects with the RPC error message on failure", async () => {
+		const client = new RpcClient() as any;
+		client.send = vi.fn().mockResolvedValue({
+			type: "response",
+			command: "generate_session_title",
+			success: false,
+			error: "Tab title generation failed: no model is available (set a default model or tabTitle.model)",
+		});
+
+		await expect(client.generateSessionTitle("/sessions/one.jsonl")).rejects.toThrow("no model is available");
+	});
+
+	it("RpcClient.setSessionName sends the expected session file only when one is given", async () => {
+		const client = new RpcClient() as any;
+		client.send = vi.fn().mockResolvedValue({ type: "response", command: "set_session_name", success: true });
+
+		await client.setSessionName("Plain rename");
+		await client.setSessionName("Guarded rename", { sessionPath: "/sessions/one.jsonl" });
+
+		expect(client.send).toHaveBeenNthCalledWith(1, { type: "set_session_name", name: "Plain rename" });
+		expect(client.send).toHaveBeenNthCalledWith(2, {
+			type: "set_session_name",
+			name: "Guarded rename",
+			sessionPath: "/sessions/one.jsonl",
+		});
+	});
+
+	it("RpcClient.setSessionName rejects with the runtime's refusal instead of reporting success", async () => {
+		const client = new RpcClient() as any;
+		const refusal =
+			"Session name not set: this runtime no longer holds /sessions/one.jsonl " +
+			"(its current session is /sessions/two.jsonl); try again";
+		client.send = vi.fn().mockResolvedValue({
+			type: "response",
+			command: "set_session_name",
+			success: false,
+			error: refusal,
+		});
+
+		await expect(client.setSessionName("Guarded rename", { sessionPath: "/sessions/one.jsonl" })).rejects.toThrow(
+			refusal,
+		);
+	});
+});
+
+describe("setSessionNameForRpc (server-side handler wiring)", () => {
+	function stubSession(sessionFile: string | undefined) {
+		return { sessionFile, setSessionName: vi.fn() };
+	}
+
+	it("renames the current session when no session file is expected", () => {
+		const session = stubSession("/sessions/a.jsonl");
+
+		expect(setSessionNameForRpc(session, "  Feature work  ")).toEqual({ ok: true });
+		expect(session.setSessionName).toHaveBeenCalledWith("Feature work");
+	});
+
+	it("rejects an empty name without renaming", () => {
+		const session = stubSession("/sessions/a.jsonl");
+
+		expect(setSessionNameForRpc(session, "   ", "/sessions/a.jsonl")).toEqual({
+			ok: false,
+			error: "Session name cannot be empty",
+		});
+		expect(session.setSessionName).not.toHaveBeenCalled();
+	});
+
+	it("renames when the expected file is the current session, comparing resolved paths", () => {
+		const session = stubSession("/sessions/a.jsonl");
+
+		expect(setSessionNameForRpc(session, "Feature work", "/sessions/x/../a.jsonl")).toEqual({ ok: true });
+		expect(session.setSessionName).toHaveBeenCalledWith("Feature work");
+	});
+
+	it("refuses a rename aimed at a session this runtime switched away from", () => {
+		const session = stubSession("/sessions/b.jsonl");
+
+		expect(setSessionNameForRpc(session, "Meant for A", "/sessions/a.jsonl")).toEqual({
+			ok: false,
+			error:
+				"Session name not set: this runtime no longer holds /sessions/a.jsonl " +
+				"(its current session is /sessions/b.jsonl); try again",
+		});
+		expect(session.setSessionName).not.toHaveBeenCalled();
+	});
+
+	it("refuses an expected file when the current session is not saved to a file", () => {
+		const session = stubSession(undefined);
+
+		const result = setSessionNameForRpc(session, "Meant for A", "/sessions/a.jsonl");
+
+		expect(result).toEqual({
+			ok: false,
+			error:
+				"Session name not set: this runtime no longer holds /sessions/a.jsonl " +
+				"(its current session is not saved to a file); try again",
+		});
+		expect(session.setSessionName).not.toHaveBeenCalled();
+	});
 });
 
 describe("deleteSessionForRpc (server-side handler wiring)", () => {
@@ -244,5 +382,25 @@ describe("listAllSessionsForRpc (server-side handler wiring)", () => {
 
 		expect(dtos).toEqual([toRpcSessionInfo(info)]);
 		expect(typeof dtos[0]?.created).toBe("string");
+	});
+
+	it("uses the flat custom-directory listing API when a custom inventory root is active", async () => {
+		const customDir = "/srv/dreb/main-sessions";
+		const info: SessionInfo = {
+			path: `${customDir}/session.jsonl`,
+			id: "custom-123",
+			cwd: "/home/user/project",
+			created: new Date("2026-09-18T10:00:00.000Z"),
+			modified: new Date("2026-09-18T11:00:00.000Z"),
+			messageCount: 1,
+			firstMessage: "custom",
+			allMessagesText: "custom",
+		};
+		const listAllSpy = vi.spyOn(SessionManager, "listAll").mockResolvedValue([]);
+		const listCustomSpy = vi.spyOn(SessionManager, "listAllFromDir").mockResolvedValue([info]);
+
+		await expect(listAllSessionsForRpc(customDir)).resolves.toEqual([toRpcSessionInfo(info)]);
+		expect(listCustomSpy).toHaveBeenCalledWith(customDir);
+		expect(listAllSpy).not.toHaveBeenCalled();
 	});
 });

@@ -23,6 +23,7 @@ export interface Args {
 	version?: boolean;
 	mode?: Mode;
 	ui?: string;
+	rpcFullMessageUpdates?: boolean;
 	noSession?: boolean;
 	session?: string;
 	fork?: string;
@@ -60,6 +61,19 @@ export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 /** Canonical list of thinking levels, shared so validators and error messages cannot drift. */
 export { VALID_THINKING_LEVELS };
 
+/**
+ * Validate `--rpc-full-message-updates` against the other parsed flags.
+ * Returns an error message for an invalid combination, or undefined if valid.
+ */
+export function validateRpcFullMessageUpdates(
+	parsed: Pick<Args, "rpcFullMessageUpdates" | "mode" | "ui">,
+): string | undefined {
+	if (!parsed.rpcFullMessageUpdates) return undefined;
+	if (parsed.mode !== "rpc") return "--rpc-full-message-updates requires --mode rpc";
+	if (parsed.ui === "dashboard") return "--rpc-full-message-updates is not supported with --ui dashboard";
+	return undefined;
+}
+
 export function parseArgs(args: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
 	const result: Args = {
 		messages: [],
@@ -81,6 +95,8 @@ export function parseArgs(args: string[], extensionFlags?: Map<string, { type: "
 			}
 		} else if (arg === "--ui" && i + 1 < args.length) {
 			result.ui = args[++i];
+		} else if (arg === "--rpc-full-message-updates") {
+			result.rpcFullMessageUpdates = true;
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
 		} else if (arg === "--resume" || arg === "-r") {
@@ -215,6 +231,7 @@ ${chalk.bold("Options:")}
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --rpc-full-message-updates     RPC only: include cumulative message/partial in message_update (legacy)
   --ui <type>                    UI type hint for system prompt (e.g. tui, telegram, rpc)
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
@@ -320,7 +337,7 @@ ${chalk.bold("Environment Variables:")}
   AWS_SECRET_ACCESS_KEY            - AWS secret key for Amazon Bedrock
   AWS_BEARER_TOKEN_BEDROCK         - Bedrock API key (bearer token)
   AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)
-  ${ENV_AGENT_DIR.padEnd(32)} - Session storage directory (default: ~/${CONFIG_DIR_NAME}/agent)
+  ${ENV_AGENT_DIR.padEnd(32)} - Agent data/config directory (default: ~/${CONFIG_DIR_NAME}/agent)
   DREB_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
   DREB_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   DREB_AI_ANTIGRAVITY_VERSION        - Override Antigravity User-Agent version (e.g., 1.23.0)

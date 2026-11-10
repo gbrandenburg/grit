@@ -12,7 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
-import { basename } from "node:path";
+import { basename, resolve } from "node:path";
 import { isValidThinkingLevel, VALID_THINKING_LEVELS } from "../../cli/args.js";
 import { VERSION } from "../../config.js";
 import type { AgentSession } from "../../core/agent-session.js";
@@ -22,7 +22,11 @@ import {
 	validateTrustedContextFolder,
 	validateTrustedContextFolders,
 } from "../../core/context-trust.js";
-import { DailyCostTracker } from "../../core/daily-cost-tracker.js";
+import {
+	type DailyCostBreakdown,
+	DailyCostTracker,
+	dailyCostSourcesForSession,
+} from "../../core/daily-cost-tracker.js";
 import {
 	acquireDreamLock,
 	buildDreamPrompt,
@@ -42,25 +46,28 @@ import type {
 import { getGitBranch } from "../../core/git-branch.js";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import { parseModelPattern, resolveModelScopePatterns } from "../../core/model-resolver.js";
-import { takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
+import { isFatalExitPending, takeOverStdout, writeRawStdout } from "../../core/output-guard.js";
 import type { SessionInfo, SessionTreeNode } from "../../core/session-manager.js";
-import { SessionManager } from "../../core/session-manager.js";
+import { readSessionTranscript, SessionManager } from "../../core/session-manager.js";
 import type { SettingsManager, TransportSetting } from "../../core/settings-manager.js";
 import { BUILTIN_SLASH_COMMANDS, parseBuiltinSlashCommand } from "../../core/slash-commands.js";
+import { SubagentSessionCostTracker } from "../../core/subagent-session-cost-tracker.js";
 import { TabTitleGenerator } from "../../core/tab-title.js";
 import { validateThinkingLevelForModel } from "../../core/thinking.js";
 import { resolveToCwd } from "../../core/tools/path-utils.js";
 import {
+	abortBackgroundAgent,
 	type BackgroundAgentInfo,
 	discoverAgentTypes,
 	getBackgroundAgentPendingSteering,
 	getBackgroundAgents,
 	rehydrateBackgroundAgentsFromDisk,
+	setSubagentRpcFullMessageUpdates,
 	steerBackgroundAgent,
 } from "../../core/tools/subagent.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
-import { createDashboardRpcEventProjector } from "./rpc-event-projection.js";
+import { createDashboardRpcEventProjector, projectRpcMessageUpdates } from "./rpc-event-projection.js";
 import type {
 	RpcAgentTypeInfo,
 	RpcBackgroundAgentInfo,
@@ -339,9 +346,84 @@ export async function deleteSessionForRpc(
 	return { ok: true, method: result.method };
 }
 
-/** Handle the `list_all_sessions` RPC command: list every project's sessions as RPC DTOs. */
-export async function listAllSessionsForRpc(): Promise<RpcSessionInfo[]> {
-	const sessions = await SessionManager.listAll();
+/**
+ * Handle the `set_session_name` RPC command. Without `sessionPath`, the current session is renamed.
+ * With it, the name is set only when this runtime's current session file is that path. The check
+ * runs synchronously right before the write, so a concurrent session switch (`/new`, resume,
+ * import) cannot redirect a rename aimed at one session file onto another.
+ */
+export function setSessionNameForRpc(
+	session: Pick<AgentSession, "sessionFile" | "setSessionName">,
+	name: string,
+	sessionPath?: string,
+): { ok: true } | { ok: false; error: string } {
+	const nextName = name.trim();
+	if (!nextName) {
+		return { ok: false, error: "Session name cannot be empty" };
+	}
+	if (sessionPath !== undefined) {
+		const current = session.sessionFile;
+		if (!current || resolve(current) !== resolve(sessionPath)) {
+			return {
+				ok: false,
+				error:
+					`Session name not set: this runtime no longer holds ${sessionPath} ` +
+					`(its current session is ${current ?? "not saved to a file"}); try again`,
+			};
+		}
+	}
+	session.setSessionName(nextName);
+	return { ok: true };
+}
+
+/**
+ * Handle the `generate_session_title` RPC command: title a saved session file on request with the
+ * same {@link TabTitleGenerator} that auto-titles live sessions. The transcript is read without
+ * modifying the file; the generator uses this runtime's tab-title settings, model registry,
+ * `agentModels` override, and current model (as the parent fallback), while messages, repo, cwd,
+ * and the forwarded session ID come from the saved session. Every failure maps to an error.
+ *
+ * Durable settings and the model registry are reloaded first: the dashboard runs this in
+ * long-lived utility runtimes whose cached settings and `models.json` models would otherwise miss
+ * later `tabTitle` / `agentModels` changes and newly added models saved by another runtime, the
+ * TUI, or a hand edit. A failed reload is an error, not a title from stale state.
+ */
+export async function generateSessionTitleForRpc(
+	session: Pick<AgentSession, "settingsManager" | "modelRegistry" | "model">,
+	sessionPath: string,
+): Promise<{ ok: true; title: string } | { ok: false; error: string }> {
+	try {
+		const { header, messages } = readSessionTranscript(sessionPath);
+		const refreshed = await settingsWriteLock(() => reloadDurableSettings(session.settingsManager));
+		if (!refreshed.ok) return refreshed;
+		// Like `get_available_models` / `resolve_model`: a pinned `tabTitle.model` or Explore route
+		// may name a model added to models.json after this runtime started.
+		session.modelRegistry.refresh();
+		const modelsError = session.modelRegistry.getError();
+		if (modelsError) return { ok: false, error: modelsError };
+		const sessionCwd = header.cwd || undefined;
+		const generator = new TabTitleGenerator(session.settingsManager.getTabTitleSettings(), {
+			setTitle: () => {},
+			getMessages: () => messages,
+			getModel: () => session.model,
+			getModelRegistry: () => session.modelRegistry,
+			getProvider: () => session.model?.provider,
+			getSessionId: () => header.id,
+			getAgentModelsOverride: (name) => session.settingsManager.getAgentModelsForAgent(name),
+			getRepo: () => (sessionCwd ? basename(sessionCwd) : undefined),
+			getCwd: () => sessionCwd,
+		});
+		generator.primeFromHistory(messages);
+		return { ok: true, title: await generator.generateNow() };
+	} catch (err) {
+		return { ok: false, error: err instanceof Error ? err.message : String(err) };
+	}
+}
+
+/** Handle `list_all_sessions` using a custom flat store when one is active. */
+export async function listAllSessionsForRpc(customDir?: string): Promise<RpcSessionInfo[]> {
+	const sessions =
+		customDir !== undefined ? await SessionManager.listAllFromDir(customDir) : await SessionManager.listAll();
 	return sessions.map(toRpcSessionInfo);
 }
 
@@ -397,11 +479,12 @@ type SettingsReader = Pick<
 	| "hasProjectEnabledModelsOverride"
 >;
 
-type SettingsRefresher = SettingsReader &
-	Pick<
-		SettingsManager,
-		"reload" | "flush" | "drainErrors" | "hasGlobalSettingsLoadError" | "hasProjectSettingsLoadError"
-	>;
+type DurableSettingsReloader = Pick<
+	SettingsManager,
+	"reload" | "flush" | "drainErrors" | "hasGlobalSettingsLoadError" | "hasProjectSettingsLoadError"
+>;
+
+type SettingsRefresher = SettingsReader & DurableSettingsReloader;
 
 type SettingsWriter = SettingsRefresher &
 	Pick<
@@ -501,53 +584,68 @@ function formatSettingsErrors(errors: Array<{ scope: string; error: Error }>): s
 }
 
 /**
+ * Flush queued settings writes, then reload durable global and project settings.
+ * Callers must hold {@link settingsWriteLock}.
+ *
+ * A failed queued write is returned before reload so its in-memory changes remain intact
+ * rather than being replaced by stale disk content. Reload failures leave SettingsManager's
+ * previous values in memory, therefore they are returned as errors instead of letting the
+ * caller proceed with stale settings.
+ */
+async function reloadDurableSettings(
+	settingsManager: DurableSettingsReloader,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+	try {
+		// A runtime setter may have enqueued a write outside the RPC settings lock.
+		// Waiting for SettingsManager's own queue protects that update from reload().
+		await settingsManager.flush();
+	} catch (error) {
+		return { ok: false, error: `Failed to refresh settings: ${(error as Error).message}` };
+	}
+
+	const writeErrors = settingsManager.drainErrors();
+	if (writeErrors.length > 0) {
+		return {
+			ok: false,
+			error: `Failed to refresh settings: pending settings write failed: ${formatSettingsErrors(writeErrors)}`,
+		};
+	}
+
+	try {
+		settingsManager.reload();
+	} catch (error) {
+		return { ok: false, error: `Failed to reload settings: ${(error as Error).message}` };
+	}
+
+	const loadErrors = settingsManager.drainErrors();
+	if (
+		loadErrors.length > 0 ||
+		settingsManager.hasGlobalSettingsLoadError() ||
+		settingsManager.hasProjectSettingsLoadError()
+	) {
+		const detail = formatSettingsErrors(loadErrors);
+		return {
+			ok: false,
+			error: detail ? `Failed to reload settings: ${detail}` : "Failed to reload settings from durable storage",
+		};
+	}
+	return { ok: true };
+}
+
+/**
  * Reload durable global and project settings before serving `get_settings`.
  *
  * The shared settings-operation lock prevents a refresh from discarding another RPC
- * settings operation's queued modifications. A failed queued write is returned before
- * reload so its in-memory changes remain intact rather than being replaced by stale disk
- * content. Reload failures leave SettingsManager's previous values in memory, therefore
- * they must be surfaced as an RPC error instead of producing a stale snapshot.
+ * settings operation's queued modifications. Reload failures must be surfaced as an RPC
+ * error instead of producing a stale snapshot (see {@link reloadDurableSettings}).
  */
 export async function getFreshSettingsForRpc(
 	settingsManager: SettingsRefresher,
 	modelRegistry?: Pick<ModelRegistry, "getAvailable">,
 ): Promise<{ ok: true; settings: RpcSettingsSnapshot } | { ok: false; error: string }> {
 	return settingsWriteLock(async () => {
-		try {
-			// A runtime setter may have enqueued a write outside the RPC settings lock.
-			// Waiting for SettingsManager's own queue protects that update from reload().
-			await settingsManager.flush();
-		} catch (error) {
-			return { ok: false as const, error: `Failed to refresh settings: ${(error as Error).message}` };
-		}
-
-		const writeErrors = settingsManager.drainErrors();
-		if (writeErrors.length > 0) {
-			return {
-				ok: false as const,
-				error: `Failed to refresh settings: pending settings write failed: ${formatSettingsErrors(writeErrors)}`,
-			};
-		}
-
-		try {
-			settingsManager.reload();
-		} catch (error) {
-			return { ok: false as const, error: `Failed to reload settings: ${(error as Error).message}` };
-		}
-
-		const loadErrors = settingsManager.drainErrors();
-		if (
-			loadErrors.length > 0 ||
-			settingsManager.hasGlobalSettingsLoadError() ||
-			settingsManager.hasProjectSettingsLoadError()
-		) {
-			const detail = formatSettingsErrors(loadErrors);
-			return {
-				ok: false as const,
-				error: detail ? `Failed to reload settings: ${detail}` : "Failed to reload settings from durable storage",
-			};
-		}
+		const refreshed = await reloadDurableSettings(settingsManager);
+		if (!refreshed.ok) return refreshed;
 
 		try {
 			const availableModels = modelRegistry ? await modelRegistry.getAvailable() : [];
@@ -1770,7 +1868,21 @@ export function cancelPendingRpcExtensionRequests(
 	}
 }
 
-export async function runRpcMode(session: AgentSession, modelFallbackMessage?: string): Promise<never> {
+export interface RpcModeOptions {
+	/**
+	 * Emit legacy full `message_update` frames (cumulative `message` and
+	 * `assistantMessageEvent.partial`). Off by default: those fields make the
+	 * stream quadratic in response length (issue 535). Ignored for dashboard
+	 * runtimes, which are always projected.
+	 */
+	fullMessageUpdates?: boolean;
+}
+
+export async function runRpcMode(
+	session: AgentSession,
+	modelFallbackMessage?: string,
+	options: RpcModeOptions = {},
+): Promise<never> {
 	takeOverStdout();
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
@@ -1793,7 +1905,10 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 	};
 
 	if (session.sessionFile && session.messages.length > 0) {
-		const rehydratedCount = rehydrateBackgroundAgentsFromDisk(session.sessionFile);
+		const rehydratedCount = rehydrateBackgroundAgentsFromDisk(
+			session.sessionFile,
+			session.subagentSessionDiscoveryRoots,
+		);
 		if (rehydratedCount > 0) {
 			console.error(
 				`[rpc] Rehydrated ${rehydratedCount} background subagent${rehydratedCount === 1 ? "" : "s"} from disk`,
@@ -1810,6 +1925,9 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 	let shutdownRequested = false;
 	let dailyCostTracker: DailyCostTracker | undefined;
 	let dailyCostTrackerPrimed = false;
+	let subagentSessionCostTracker: SubagentSessionCostTracker | undefined;
+	let subagentCostGeneration = 0;
+	let refreshedSubagentCostGeneration = -1;
 
 	// Extension UI context uses the RPC protocol; built by a module-scope
 	// factory so the dialog round trip is unit-testable (see createRpcExtensionUIContext).
@@ -1855,13 +1973,13 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 		},
 	});
 
-	const getDailyCost = async (): Promise<number> => {
-		dailyCostTracker ??= new DailyCostTracker();
+	const getDailyCostBreakdown = async (): Promise<DailyCostBreakdown> => {
+		dailyCostTracker ??= new DailyCostTracker(dailyCostSourcesForSession(session));
 		if (!dailyCostTrackerPrimed) {
 			await dailyCostTracker.refresh();
 			dailyCostTrackerPrimed = true;
 		}
-		return dailyCostTracker.getDailyCost();
+		return dailyCostTracker.getDailyCostBreakdown();
 	};
 
 	const cwd = session.cwd;
@@ -1893,20 +2011,33 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 				})
 			: undefined;
 
-	// Dashboard-launched runtimes (--ui dashboard) get events projected before
-	// serialization: message_update's cumulative `message` and
-	// `assistantMessageEvent.partial` fields are quadratic in response length on
-	// the JSONL pipe, and no dashboard consumer reads them (deltas, message_end,
-	// and get_dashboard_snapshot responses carry the authoritative data). Inline
-	// image blocks are deduped over the process lifetime so each unique image
-	// crosses stdout at most once — later occurrences become image_references
-	// the dashboard resolves from its image cache (issue 495). Generic RPC
-	// consumers keep the full protocol unchanged. Only the event stream is
+	// Events are projected before serialization. message_update's cumulative
+	// `message` and `assistantMessageEvent.partial` fields are quadratic in
+	// response length on the JSONL pipe (issues 448, 535), so every RPC runtime
+	// strips them by default; deltas, message_end, and command responses carry
+	// the authoritative data. `--rpc-full-message-updates` restores the legacy
+	// full frames for generic clients. Dashboard runtimes (--ui dashboard) are
+	// always projected and additionally dedupe inline images over the process
+	// lifetime — later occurrences become image_references the dashboard
+	// resolves from its image cache (issue 495). Only the event stream is
 	// projected — command responses (output() calls below) always stay complete.
-	const dashboardEventProjector = session.uiType === "dashboard" ? createDashboardRpcEventProjector() : undefined;
+	const eventProjector: ((event: Record<string, unknown>) => Record<string, unknown>) | undefined =
+		session.uiType === "dashboard"
+			? createDashboardRpcEventProjector()
+			: options.fullMessageUpdates
+				? undefined
+				: projectRpcMessageUpdates;
+	// Forward the opt-in to RPC-controlled subagent children: their relayed
+	// background_agent_event payloads are projected inside the child process and
+	// cannot be restored here, so the child must emit full frames itself.
+	setSubagentRpcFullMessageUpdates(eventProjector === undefined);
 
 	// Output all agent events as JSON
 	session.subscribe((event) => {
+		if (event.type === "background_agent_end") {
+			// Force the next stats request to await a fresh per-session cost scan.
+			subagentCostGeneration++;
+		}
 		if (tabTitleGenerator && !session.sessionName) {
 			if (event.type === "tool_execution_end") {
 				tabTitleGenerator.onToolEnd({
@@ -1918,7 +2049,7 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 				tabTitleGenerator.onMessageEnd(event.message);
 			}
 		}
-		output(dashboardEventProjector ? dashboardEventProjector(event as unknown as Record<string, unknown>) : event);
+		output(eventProjector ? eventProjector(event as unknown as Record<string, unknown>) : event);
 	});
 
 	// Handle a single command
@@ -2040,7 +2171,12 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 			}
 
 			case "get_daily_cost": {
-				return success(id, "get_daily_cost", { cost: await getDailyCost() });
+				const breakdown = await getDailyCostBreakdown();
+				return success(id, "get_daily_cost", {
+					cost: breakdown.total,
+					main: breakdown.main,
+					subagent: breakdown.subagent,
+				});
 			}
 
 			// =================================================================
@@ -2208,8 +2344,17 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 			// =================================================================
 
 			case "get_session_stats": {
+				subagentSessionCostTracker ??= new SubagentSessionCostTracker();
+				if (refreshedSubagentCostGeneration !== subagentCostGeneration) {
+					const refreshGeneration = subagentCostGeneration;
+					await subagentSessionCostTracker.refresh();
+					refreshedSubagentCostGeneration = refreshGeneration;
+				}
 				const stats = session.getSessionStats();
-				return success(id, "get_session_stats", stats);
+				return success(id, "get_session_stats", {
+					...stats,
+					subagentCost: subagentSessionCostTracker.getCost(),
+				});
 			}
 
 			case "get_performance_stats": {
@@ -2237,6 +2382,14 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 					return error(id, "delete_session", result.error);
 				}
 				return success(id, "delete_session", { method: result.method });
+			}
+
+			case "generate_session_title": {
+				const result = await generateSessionTitleForRpc(session, command.sessionPath);
+				if (!result.ok) {
+					return error(id, "generate_session_title", result.error);
+				}
+				return success(id, "generate_session_title", { title: result.title });
 			}
 
 			case "fork": {
@@ -2273,11 +2426,10 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 			}
 
 			case "set_session_name": {
-				const name = command.name.trim();
-				if (!name) {
-					return error(id, "set_session_name", "Session name cannot be empty");
+				const result = setSessionNameForRpc(session, command.name, command.sessionPath);
+				if (!result.ok) {
+					return error(id, "set_session_name", result.error);
 				}
-				session.setSessionName(name);
 				return success(id, "set_session_name");
 			}
 
@@ -2307,7 +2459,9 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 			}
 
 			case "list_all_sessions": {
-				return success(id, "list_all_sessions", { sessions: await listAllSessionsForRpc() });
+				return success(id, "list_all_sessions", {
+					sessions: await listAllSessionsForRpc(session.sessionManager.getCustomSessionInventoryRoot()),
+				});
 			}
 
 			// =================================================================
@@ -2333,6 +2487,13 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 					"get_background_agent_pending",
 					await getBackgroundAgentPendingSteering(command.agentId),
 				);
+			}
+
+			case "abort_background_agent": {
+				// Cancels only the selected child; the parent run and siblings are untouched.
+				// Completion arrives later as background_agent_end with cancelled: true.
+				abortBackgroundAgent(command.agentId);
+				return success(id, "abort_background_agent");
 			}
 
 			case "list_agent_types": {
@@ -2434,8 +2595,15 @@ export async function runRpcMode(session: AgentSession, modelFallbackMessage?: s
 		}
 
 		dailyCostTracker?.dispose();
+		subagentSessionCostTracker?.dispose();
 		detachInput();
 		process.stdin.pause();
+		if (isFatalExitPending()) {
+			// A stdout write failure is already exiting the process nonzero (a dying
+			// consumer often closes stdin and stdout together). Exiting 0 here would
+			// truncate its diagnostic and report success; let the fatal path finish.
+			return new Promise<never>(() => {});
+		}
 		process.exit(0);
 	}
 

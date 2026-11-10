@@ -173,7 +173,7 @@ beforeAll(async () => {
 		const json = (body: unknown) => route.fulfill({ contentType: "application/json", body: JSON.stringify(body) });
 
 		if (path === "/api/auth") return json({ mode: "local", needsPairing: false });
-		if (path === "/api/fleet") return json({ runtimes: fleetRuntimes, diskSessions: [] });
+		if (path === "/api/fleet/live") return json({ runtimes: fleetRuntimes, diskSessions: [] });
 		if (path === "/api/sessions") return json({ sessions: [] });
 		if (path === "/api/daily-cost") return json({ cost: 0 });
 		if (path === "/api/version") return json({ version: "test" });
@@ -266,7 +266,9 @@ async function openSession(
 		window.location.hash = `#/session/${key}`;
 	}, key);
 	try {
-		await page.locator(SIDEBAR).first().waitFor({ state: "attached", timeout: 5_000 });
+		// Same budget as expectVisible: under full-workspace test load the Vite dev
+		// server and Chromium can take well over 5s to route and mount the session.
+		await page.locator(SIDEBAR).first().waitFor({ state: "attached", timeout: 30_000 });
 	} catch (error) {
 		throw new Error(
 			`Sidebar did not mount; page errors: ${pageErrors.join("; ")}; API calls: ${apiCalls.join(", ")}`,
